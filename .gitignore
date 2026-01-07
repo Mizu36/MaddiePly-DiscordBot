@@ -1,0 +1,11 @@
+.github/
+credentials.json
+__pycache__/
+.env
+venv/
+scripts/
+games/
+dist/
+data/
+build/
+settings.txt
