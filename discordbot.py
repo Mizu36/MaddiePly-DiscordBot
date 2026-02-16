@@ -19,6 +19,7 @@ import asyncio
 import asqlite
 import discord
 import datetime
+from random import randint, choice
 from discord.ext import commands
 from discord import app_commands
 
@@ -111,8 +112,9 @@ class DiscordBot:
         except Exception as e:
             debug_print("DiscordBot", f"Failed to sync command tree: {e}")
 
-    async def _clear_guild_scoped_commands(self) -> None:
-        """Remove any lingering guild-specific slash commands so only globals remain."""
+    async def _clear_guild_scoped_commands(self) -> int:
+        """Remove lingering guild-specific slash commands so only globals remain."""
+        cleared_total = 0
         for guild in list(self.bot.guilds):
             try:
                 existing = await self.bot.tree.fetch_commands(guild=guild)
@@ -124,12 +126,14 @@ class DiscordBot:
             try:
                 self.bot.tree.clear_commands(guild=discord.Object(id=guild.id))
                 await self.bot.tree.sync(guild=guild)
+                cleared_total += len(existing)
                 debug_print(
                     "DiscordBot",
                     f"Cleared {len(existing)} guild-specific command(s) for {guild.name} ({guild.id}).",
                 )
             except Exception as exc:
                 debug_print("DiscordBot", f"Failed to clear commands for guild {guild.id}: {exc}")
+        return cleared_total
 
     async def _on_message_listener(self, message: discord.Message):
         if message.author == self.bot.user:
@@ -198,6 +202,12 @@ class DiscordBot:
         if len(message.content) > await get_setting("Discord Max Message Length", 500):
             debug_print("DiscordBot", f"Message from {message.author} exceeded max length and was ignored.")
             return
+        if message.reference:
+            reference_message_id = message.reference.message_id
+            referenced_message = await message.channel.fetch_message(reference_message_id)
+            if referenced_message.author == self.bot.user:
+                await self.respond_to_reply(message, referenced_message)
+                return
         timer = self._get_response_timer()
         if timer is None:
             debug_print("DiscordBot", "ResponseTimer unavailable; skipping message queue append.")
@@ -216,6 +226,8 @@ class DiscordBot:
             await self.handle_askmaddie(message)
             await update_task
             return
+        if randint(1, 100) <= await get_setting("Chance For Reaction", 0) or "maddie" in content.lower() or "maddieply" in content.lower(): #Will react to a message if mentioning MaddiePly or randomly based on Chance For Reaction setting
+            await self.apply_reaction(message)
         channel_id = message.channel.id
         if channel_id != self.general_channel_id:
             return
@@ -390,6 +402,26 @@ class DiscordBot:
             debug_print("DiscordBot", f"reload command used by {ctx.author}.")
             await self.reload(ctx)
 
+    async def refresh_slash_commands(self) -> dict[str, int]:
+        """Forcefully remove and re-register all slash commands."""
+        await self.bot.wait_until_ready()
+        debug_print("DiscordBot", "Manual slash command refresh started.")
+        cleared_guild_cmds = await self._clear_guild_scoped_commands()
+
+        # Explicitly pass guild=None because discord.py now requires the keyword.
+        self.bot.tree.clear_commands(guild=None)
+
+        self._register_commands()
+        registered = await self.bot.tree.sync()
+
+        summary = {
+            "guilds_processed": len(self.bot.guilds),
+            "guild_commands_cleared": cleared_guild_cmds,
+            "global_registered": len(registered),
+        }
+        debug_print("DiscordBot", f"Slash command refresh finished: {summary}")
+        return summary
+
     async def askmaddie(self, ctx: commands.Context):
         """Responds to user's message and takes in context including attachments and parent message if is reply."""
         asyncio.create_task(self.handle_askmaddie(message=ctx.message))
@@ -491,6 +523,15 @@ class DiscordBot:
             self.chatGPT = get_reference("GPTManager")
         ask_prompt = {"role": "system", "content": await get_prompt("Respond to User Prompt")}
         response = await asyncio.to_thread(self.chatGPT.handle_chat, ask_prompt, context_prompt)
+        await message.reply(response, mention_author=False)
+
+    async def respond_to_reply(self, message: discord.Message, referenced_message: discord.Message):
+        #Insert reply handling logic here, similar to handle_askmaddie but with a different system prompt and possibly different context construction
+        new_message_content = message.content.strip()
+        referenced_message_content = referenced_message.content.strip() if referenced_message.content else ""
+        reply_prompt = {"role": "system", "content": await get_prompt("Respond to Reply Prompt")}
+        context_prompt = {"role": "user", "content": f"Original message:\nYou: {referenced_message_content}\nReply:\n{message.author.nick or message.author.name}: {new_message_content}"}
+        response = await asyncio.to_thread(self.chatGPT.handle_chat, reply_prompt, context_prompt)
         await message.reply(response, mention_author=False)
 
     async def handle_clapback(self, message: discord.Message):
@@ -793,6 +834,35 @@ class DiscordBot:
             future.result()
         else:
             await asyncio.wrap_future(future, loop=current_loop)
+
+    async def apply_reaction(self, message: discord.Message):
+        """Add a reaction to the message by attempting to ask the bot, if that fails, a random reaction will be added instead."""
+        try:
+            guild = message.guild
+            emojis = guild.emojis
+            content = message.content
+            task_prompt = {"role": "system", "content": "TASK: Choose an appropriate reaction emoji to add to the following message. Only respond with the name of the emoji, and nothing else. You may only select from emoji provided to you, not any global ones. If you cannot determine an appropriate reaction, choose an absurd one, but you must select one no matter what.\n\nMESSAGE CONTENT:\n" + (content)}
+            discord_emotes_prompt = {"role": "system", "content": await get_prompt("Discord Emotes")}
+            if not self.chatGPT:
+                self.chatGPT = get_reference("GPTManager")
+            reaction_response = await asyncio.to_thread(self.chatGPT.handle_chat, task_prompt, discord_emotes_prompt)
+            reaction_response = reaction_response.strip()
+            if reaction_response.lower() != "random":
+                #Grab only text between two colons if the response is in format <:emojoname:emojiid>
+                emote_name_match = re.match(r"<a?:(\w+):\d+>", reaction_response)
+                print(f"Reaction response: {reaction_response}, Emote name match: {emote_name_match.group(1) if emote_name_match else 'No match'}")
+                if emote_name_match:
+                    reaction_response = emote_name_match.group(1)
+                selected_emoji = next((emoji for emoji in emojis if emoji.name == reaction_response), None)
+                if selected_emoji:
+                    await message.add_reaction(selected_emoji)
+                    return
+            print(f"Failed to get valid emoji from GPT response, defaulting to random. GPT response was: {reaction_response}")
+            random_emoji = choice(emojis) if emojis else None
+            if random_emoji:
+                await message.add_reaction(random_emoji)
+        except Exception as exc:
+            debug_print("DiscordBot", f"Failed to add a reaction: {exc}")
 
     # ------------------------------------------------------------------
     # Helpers
