@@ -164,10 +164,11 @@ class DBEditor(tk.Tk):
 
         btn_frame = ttk.Frame(tree_frame)
         btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        btn_frame.columnconfigure((0, 1), weight=1)
+        btn_frame.columnconfigure((0, 1, 2), weight=1)
 
         ttk.Button(btn_frame, text="Edit", command=lambda: self._open_setting_dialog(edit_existing=True)).grid(row=0, column=0, sticky="ew", padx=2)
         ttk.Button(btn_frame, text="Refresh", command=lambda: self.refresh_table("settings")).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Button(btn_frame, text="Resync Slash Commands", command=self._resync_slash_commands).grid(row=0, column=2, sticky="ew", padx=2)
 
         inline = ttk.Frame(tab)
         inline.grid(row=1, column=0, sticky="nw", padx=10, pady=(0, 10))
@@ -1405,6 +1406,57 @@ class DBEditor(tk.Tk):
 
     def _refresh_shared_chat_settings_async(self) -> None:
         debug_print("GUI", "Shared chat settings refreshed.")
+
+    def _resync_slash_commands(self) -> None:
+        if not messagebox.askyesno(
+            "Resync Slash Commands",
+            "This will unregister all slash commands across every guild before re-registering the current set. Continue?",
+            parent=self,
+        ):
+            return
+
+        bot = self._get_cached_reference("DiscordBot")
+        if bot is None or not hasattr(bot, "refresh_slash_commands"):
+            messagebox.showerror(
+                "Resync Slash Commands",
+                "The Discord bot is not running, so commands cannot be refreshed.",
+                parent=self,
+            )
+            return
+
+        def _worker() -> None:
+            try:
+                loop = getattr(bot.bot, "loop", None)
+                if loop is None or not loop.is_running():
+                    raise RuntimeError("Discord bot loop is not running.")
+                future = asyncio.run_coroutine_threadsafe(bot.refresh_slash_commands(), loop)
+                summary = future.result(timeout=180)
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda err=exc: messagebox.showerror(
+                        "Resync Slash Commands",
+                        f"Failed to refresh slash commands.\n{err}",
+                        parent=self,
+                    ),
+                )
+                return
+
+            def _notify() -> None:
+                registered = 0
+                guilds = len(getattr(bot.bot, "guilds", []) or [])
+                if isinstance(summary, dict):
+                    registered = int(summary.get("global_registered", 0) or 0)
+                    guilds = int(summary.get("guilds_processed", guilds) or guilds)
+                messagebox.showinfo(
+                    "Resync Slash Commands",
+                    f"Slash commands successfully re-registered.\nGlobal commands: {registered}\nGuilds processed: {guilds}",
+                    parent=self,
+                )
+
+            self.after(0, _notify)
+
+        threading.Thread(target=_worker, name="SlashCommandResync", daemon=True).start()
 
     # ------------------------------------------------------------------
     # Background helpers / shutdown
