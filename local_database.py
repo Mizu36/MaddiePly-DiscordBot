@@ -22,6 +22,7 @@ REQUIRED_SETTINGS = {
     "Discord Announcement Channel ID": ("0", "INTEGER"),
     "Discord General Channel ID": ("0", "INTEGER"),
     "Discord Moderation Logs Channel ID": ("0", "INTEGER"),
+    "Discord Moderator Chat Channel ID": ("0", "INTEGER"),
     "Discord Game Channel ID": ("0", "INTEGER"),
     "Discord Max Message Length": ("500", "INTEGER"),
     "Discord New Account Age Threshold Days": ("7", "INTEGER"),
@@ -486,18 +487,35 @@ async def _get_setting_internal(key: str, default: Any = None) -> Any:
 async def update_setting(key: str, value: Any) -> None:
     """Update a setting value by key."""
     debug_print("Database", f"Updating setting for key '{key}' to value '{value}'.")
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if current_loop is not None and current_loop is DATABASE_LOOP:
+        await _update_setting_internal(key, value)
+        return
+
+    if DATABASE_LOOP is None:
+        raise RuntimeError("Database loop is not initialized.")
+
+    future = asyncio.run_coroutine_threadsafe(_update_setting_internal(key, value), DATABASE_LOOP)
+    if current_loop is None:
+        future.result()
+    else:
+        await asyncio.wrap_future(future, loop=current_loop)
+
+
+async def _update_setting_internal(key: str, value: Any) -> None:
+    if DATABASE is None:
+        raise RuntimeError("DATABASE pool is None; did setup_database() run?")
     async with DATABASE.acquire() as connection:
-        # First, retrieve the data_type for the key
         cursor = await connection.execute("SELECT data_type FROM settings WHERE key = ?", (key,))
         row = await cursor.fetchone()
         if not row:
             raise ValueError(f"Setting key '{key}' not found in database.")
         dtype = row["data_type"]
-
-        # Coerce the provided value to the appropriate storage format
         val_str = coerce_value_for_type(value, dtype)
-
-        # Update the setting value
         await connection.execute(
             "UPDATE settings SET value = ? WHERE key = ?", (val_str, key)
         )
@@ -506,7 +524,27 @@ async def update_setting(key: str, value: Any) -> None:
 async def get_all_settings() -> dict[str, Any]:
     """Retrieve all settings as a dictionary of key-value pairs."""
     debug_print("Database", "Fetching all settings from database.")
-    settings = {}
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if current_loop is not None and current_loop is DATABASE_LOOP:
+        return await _get_all_settings_internal()
+
+    if DATABASE_LOOP is None:
+        raise RuntimeError("Database loop is not initialized.")
+
+    future = asyncio.run_coroutine_threadsafe(_get_all_settings_internal(), DATABASE_LOOP)
+    if current_loop is None:
+        return future.result()
+    return await asyncio.wrap_future(future, loop=current_loop)
+
+
+async def _get_all_settings_internal() -> dict[str, dict[str, Any]]:
+    settings: dict[str, dict[str, Any]] = {}
+    if DATABASE is None:
+        raise RuntimeError("DATABASE pool is None; did setup_database() run?")
     async with DATABASE.acquire() as connection:
         cursor = await connection.execute("SELECT key, value, data_type FROM settings")
         rows = await cursor.fetchall()
@@ -516,16 +554,14 @@ async def get_all_settings() -> dict[str, Any]:
             dtype = row["data_type"]
             # Coerce value to appropriate type
             if dtype == "BOOL":
-                if val == "True" or val == "1":
-                    settings[key] = True
-                else:
-                    settings[key] = False
+                parsed = val in {"True", "1"}
             elif dtype == "INTEGER":
-                settings[key] = int(val)
+                parsed = int(val)
             elif dtype == "FLOAT":
-                settings[key] = float(val)
+                parsed = float(val)
             else:
-                settings[key] = val  # TEXT and other types
+                parsed = val  # TEXT and other types
+            settings[key] = {"value": parsed, "type": dtype}
     return settings
 
 async def get_prompt(name: str) -> str:

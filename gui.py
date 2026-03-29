@@ -99,6 +99,12 @@ class DBEditor(tk.Tk):
         self._stderr_redirector: ConsoleRedirector | None = None
         self.response_status_label: ttk.Label | None = None
         self._reference_cache: dict[str, object] = {}
+        self._probation_tree: ttk.Treeview | None = None
+        self._probation_row_lookup: dict[str, dict[str, typing.Any]] = {}
+        self._probation_rows: list[dict[str, typing.Any]] = []
+        self._probation_tab: ttk.Frame | None = None
+        self._probation_refresh_job: str | None = None
+        self._notebook: ttk.Notebook | None = None
 
         self._build_ui()
         self._build_response_overlay()
@@ -124,14 +130,17 @@ class DBEditor(tk.Tk):
 
         notebook = ttk.Notebook(container)
         notebook.pack(fill=tk.BOTH, expand=True)
+        self._notebook = notebook
 
         self._build_settings_tab(notebook)
         self._build_prompts_tab(notebook)
         self._build_prompt_rules_tab(notebook)
         self._build_policies_tab(notebook)
         self._build_memory_tab(notebook)
+        self._build_probation_tab(notebook)
         self._build_users_tab(notebook)
         self._build_console_tab(notebook)
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     # ------------------------------------------------------------------
     # Settings tab
@@ -821,6 +830,285 @@ class DBEditor(tk.Tk):
         widget.configure(state="disabled")
 
     # ------------------------------------------------------------------
+    # Probation tab
+    # ------------------------------------------------------------------
+    def _build_probation_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text="Probation")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+
+        columns = ("user_id", "username", "display_name", "rolling_points", "total_points")
+        headings = {
+            "user_id": "User ID",
+            "username": "User Name",
+            "display_name": "Display Name",
+            "rolling_points": "Rolling Points",
+            "total_points": "Total Points",
+        }
+        tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="browse")
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            anchor = tk.W if column in {"username", "display_name"} else tk.CENTER
+            tree.column(column, anchor=anchor)
+        tree.tag_configure("row_light", background=ROW_STRIPE_LIGHT)
+        tree.tag_configure("row_dark", background=ROW_STRIPE_DARK)
+        tree.grid(row=0, column=0, sticky="nsew")
+        self._probation_tree = tree
+        self._probation_tab = tab
+
+        yscroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        yscroll.grid(row=0, column=1, sticky="ns")
+
+        btn_frame = ttk.Frame(tab)
+        btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        btn_frame.columnconfigure((0, 1, 2), weight=1)
+        ttk.Button(btn_frame, text="Kick", command=self._kick_selected_probation_user).grid(row=0, column=0, sticky="ew", padx=4)
+        ttk.Button(btn_frame, text="Remove from Probation", command=self._remove_probation_for_selected_user).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(btn_frame, text="Reset Points", command=self._reset_probation_points).grid(row=0, column=2, sticky="ew", padx=4)
+
+    def _refresh_probation_tab(self) -> None:
+        if self._probation_tree is None:
+            return
+        selection = self._probation_tree.selection()
+        selected_iid = selection[0] if selection else None
+        self._fetch_probation_rows(selected_iid)
+
+    def _fetch_probation_rows(self, selected_iid: str | None) -> None:
+        bot = self._get_cached_reference("DiscordBot")
+        if bot is None or not isinstance(bot, DiscordBot):
+            self._apply_probation_rows([], selected_iid)
+            return
+        loop = getattr(bot.bot, "loop", None)
+        if loop is None or not loop.is_running():
+            self._apply_probation_rows([], selected_iid)
+            return
+
+        def _worker() -> None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(bot.get_probation_snapshot(), loop)
+                rows = future.result(timeout=10)
+            except Exception as exc:
+                debug_print("GUI", f"Failed to fetch probation snapshot: {exc}")
+                rows = []
+            self.after(0, lambda data=rows, iid=selected_iid: self._apply_probation_rows(data, iid))
+
+        threading.Thread(target=_worker, name="ProbationRefresh", daemon=True).start()
+
+    def _apply_probation_rows(self, rows: list[dict[str, typing.Any]], selected_iid: str | None) -> None:
+        if self._probation_tree is None:
+            return
+        tree = self._probation_tree
+        previous_selection = selected_iid
+        if previous_selection is None:
+            current = tree.selection()
+            previous_selection = current[0] if current else None
+        for iid in tree.get_children():
+            tree.delete(iid)
+        self._probation_row_lookup.clear()
+        self._probation_rows = rows
+        for idx, row in enumerate(rows):
+            user_id = row.get("user_id")
+            iid = str(user_id) if user_id is not None else f"probation-{idx}"
+            self._probation_row_lookup[iid] = row
+            values = (
+                row.get("user_id", "Unknown"),
+                row.get("username") or "Unknown",
+                row.get("display_name") or row.get("username") or "Unknown",
+                row.get("rolling_points", 0),
+                row.get("total_points", 0),
+            )
+            tag = "row_light" if idx % 2 == 0 else "row_dark"
+            tree.insert("", tk.END, iid=iid, values=values, tags=(tag,))
+
+        target_selection = None
+        if previous_selection and tree.exists(previous_selection):
+            target_selection = previous_selection
+        elif rows:
+            fallback_id = str(rows[0].get("user_id"))
+            if fallback_id and tree.exists(fallback_id):
+                target_selection = fallback_id
+        if target_selection:
+            try:
+                tree.selection_set(target_selection)
+                tree.focus(target_selection)
+            except Exception:
+                pass
+        self.autosize_columns(tree)
+
+    def _get_selected_probation_row(self) -> tuple[str, dict[str, typing.Any]] | None:
+        tree = self._probation_tree
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            messagebox.showinfo("Probation", "Select a user first.", parent=self)
+            return None
+        iid = selection[0]
+        row = self._probation_row_lookup.get(iid)
+        if row is None:
+            messagebox.showerror("Probation", "Unable to load the selected user.", parent=self)
+            return None
+        return iid, row
+
+    def _kick_selected_probation_user(self) -> None:
+        selected = self._get_selected_probation_row()
+        if not selected:
+            return
+        _, row = selected
+        user_id = row.get("user_id")
+        if user_id is None:
+            messagebox.showerror("Kick User", "User ID is not available for the selected row.", parent=self)
+            return
+        display = row.get("display_name") or row.get("username") or str(user_id)
+        if not messagebox.askyesno("Kick User", f"Kick {display} (ID {user_id})?", parent=self):
+            return
+
+        def _on_success(_result: typing.Any) -> None:
+            messagebox.showinfo("Kick User", f"Kick initiated for {display}.", parent=self)
+            self._refresh_probation_tab()
+
+        self._call_discord_bot(
+            lambda bot, uid=int(user_id): bot.kick_user(uid, "Manual kick triggered from GUI"),
+            on_success=_on_success,
+            title="Kick User",
+            timeout=30,
+        )
+
+    def _remove_probation_for_selected_user(self) -> None:
+        selected = self._get_selected_probation_row()
+        if not selected:
+            return
+        _, row = selected
+        user_id = row.get("user_id")
+        if user_id is None:
+            messagebox.showerror("Remove from Probation", "User ID is not available for the selected row.", parent=self)
+            return
+        display = row.get("display_name") or row.get("username") or str(user_id)
+
+        def _on_success(removed: bool) -> None:
+            message = (
+                f"Removed probation tracking for {display}."
+                if removed
+                else f"{display} is not currently on probation."
+            )
+            messagebox.showinfo("Remove from Probation", message, parent=self)
+            self._refresh_probation_tab()
+
+        self._call_discord_bot(
+            lambda bot, uid=int(user_id): bot.remove_probation_entry(uid),
+            on_success=_on_success,
+            title="Remove from Probation",
+        )
+
+    def _reset_probation_points(self) -> None:
+        selected = self._get_selected_probation_row()
+        if not selected:
+            return
+        _, row = selected
+        user_id = row.get("user_id")
+        if user_id is None:
+            messagebox.showerror("Reset Points", "User ID is not available for the selected row.", parent=self)
+            return
+        display = row.get("display_name") or row.get("username") or str(user_id)
+        if not messagebox.askyesno("Reset Points", f"Reset probation points for {display}?", parent=self):
+            return
+
+        def _on_success(reset: bool) -> None:
+            message = (
+                f"Reset probation points for {display}."
+                if reset
+                else f"{display} is not currently on probation."
+            )
+            messagebox.showinfo("Reset Points", message, parent=self)
+            self._refresh_probation_tab()
+
+        self._call_discord_bot(
+            lambda bot, uid=int(user_id): bot.reset_probation_points(uid),
+            on_success=_on_success,
+            title="Reset Points",
+        )
+
+    def _call_discord_bot(
+        self,
+        coro_factory: typing.Callable[[DiscordBot], typing.Awaitable[typing.Any]],
+        *,
+        on_success: typing.Callable[[typing.Any], None] | None = None,
+        on_error: typing.Callable[[Exception], None] | None = None,
+        title: str = "Discord Action",
+        timeout: float = 15.0,
+    ) -> None:
+        bot = self._get_cached_reference("DiscordBot")
+        if bot is None or not isinstance(bot, DiscordBot):
+            messagebox.showerror(title, "The Discord bot is not currently running.", parent=self)
+            return
+        loop = getattr(bot.bot, "loop", None)
+        if loop is None or not loop.is_running():
+            messagebox.showerror(title, "The Discord bot event loop is not running.", parent=self)
+            return
+
+        def _worker() -> None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro_factory(bot), loop)
+                result = future.result(timeout=timeout)
+            except Exception as exc:
+                debug_print("GUI", f"{title} failed: {exc}")
+                if on_error is not None:
+                    self.after(0, lambda err=exc: on_error(err))
+                else:
+                    self.after(0, lambda err=exc: messagebox.showerror(title, f"Action failed: {err}", parent=self))
+                return
+            if on_success is not None:
+                self.after(0, lambda res=result: on_success(res))
+
+        threading.Thread(target=_worker, name=f"ProbationAction-{title}", daemon=True).start()
+
+    def _on_tab_changed(self, event) -> None:
+        if self._probation_tab is None or self._notebook is None:
+            return
+        widget = event.widget
+        if widget is not self._notebook:
+            return
+        if self._is_probation_tab_active():
+            self._refresh_probation_tab()
+            self._schedule_probation_refresh()
+        else:
+            self._cancel_probation_refresh()
+
+    def _is_probation_tab_active(self) -> bool:
+        if self._probation_tab is None or self._notebook is None:
+            return False
+        try:
+            current = self._notebook.select()
+        except Exception:
+            return False
+        return str(current) == str(self._probation_tab)
+
+    def _schedule_probation_refresh(self) -> None:
+        self._cancel_probation_refresh()
+        if not self._is_probation_tab_active():
+            return
+        self._probation_refresh_job = self.after(10000, self._probation_refresh_loop)
+
+    def _cancel_probation_refresh(self) -> None:
+        if self._probation_refresh_job is None:
+            return
+        try:
+            self.after_cancel(self._probation_refresh_job)
+        except Exception:
+            pass
+        finally:
+            self._probation_refresh_job = None
+
+    def _probation_refresh_loop(self) -> None:
+        self._probation_refresh_job = None
+        if not self._is_probation_tab_active():
+            return
+        self._refresh_probation_tab()
+        self._schedule_probation_refresh()
+
+    # ------------------------------------------------------------------
     # Reference helpers
     # ------------------------------------------------------------------
     def _get_cached_reference(self, name: str):
@@ -1476,6 +1764,7 @@ class DBEditor(tk.Tk):
         threading.Thread(target=run_bot, daemon=True).start()
 
     def _on_close(self):
+        self._cancel_probation_refresh()
         try:
             debug_print("GUI", "Scheduling async database pool close (non-blocking).")
             close_database_sync(wait=False)

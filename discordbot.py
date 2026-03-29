@@ -14,6 +14,7 @@ from local_database import (
 )
 from ai_logic import setup_gpt_manager
 from google_api import GoogleSheets
+from automod import Probation
 import os
 import asyncio
 import asqlite
@@ -22,6 +23,11 @@ import datetime
 from random import randint, choice
 from discord.ext import commands
 from discord import app_commands
+from typing import Any, Dict, List
+
+
+MESSAGE_LINK_RE = re.compile(r"https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/(\d+|@me)/(\d+)/(\d+)")
+CUSTOM_EMOJI_RE = re.compile(r"<a?:[a-zA-Z0-9_]+:[0-9]+>")
 
 class DiscordBot:
     def __init__(self, token: str, prefix: str):
@@ -33,7 +39,11 @@ class DiscordBot:
         self.owner_name = None
         self.token = token
         self.prefix = prefix
-        self.prefix_commands = [("askmaddie", "Directly talk to MaddiePly, the AI assistant. Include a message after the command or she will roast you."), ("policy", "Request information on policies regarding the subject. Include a message after the command or MaddiePly will roast you.")]
+        self.prefix_commands = [
+            ("askmaddie", "Directly talk to MaddiePly, the AI assistant. Include a message after the command or she will roast you."),
+            ("policy", "Request information on policies regarding the subject. Include a message after the command or MaddiePly will roast you."),
+            ("report", "Report suspicious messages by replying with !report <reason>."),
+        ]
         debug_print("DiscordBot", f"Initialized with prefix: {self.prefix}")
         self.timezones = {
             "PST": "America/Los_Angeles",
@@ -85,6 +95,8 @@ class DiscordBot:
         self.general_channel_id = None
         self.online_database = get_reference("OnlineDatabase")
         self.response_timer = get_reference("ResponseTimer")
+        self.probations = {}
+        self.users_to_kick = {}
 
     def run_forever(self) -> None:
         async def _runner():
@@ -102,7 +114,7 @@ class DiscordBot:
     async def on_ready(self):
         debug_print("DiscordBot", f"Logged in as {self.bot.user} (ID: {self.bot.user.id})")
         self.owner_id = await get_setting("Owner Discord ID", 0)
-        self.owner_name = await get_setting("Owner Name", "ModdiPly")
+        self.owner_name = await get_setting("Owner Name", "None")
         self.general_channel_id = await get_setting("Discord General Channel ID", 0)
         debug_print("DiscordBot", f"Owner set to {self.owner_name} (ID: {str(self.owner_id)})")
         try:
@@ -167,14 +179,70 @@ class DiscordBot:
         debug_print("DiscordBot", f"Member removed: {name} (ID: {member.id})")
 
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.Member | discord.User):
+        if user.bot:
+            return
         if hasattr(user, 'nick'):
             name = user.nick
         else:
             name = user.name
         debug_print("DiscordBot", f"Reaction added by {name} on message ID {reaction.message.id}")
-        # Further reaction handling logic goes here
+
+        pending_entry = next(
+            ((uid, info) for uid, info in self.users_to_kick.items() if info.get("notification_message_id") == reaction.message.id),
+            None,
+        )
+        if not pending_entry:
+            return
+
+        user_id, kick_info = pending_entry
+        member = reaction.message.guild.get_member(user_id)
+        mod_channel = reaction.message.channel
+        emoji = str(reaction.emoji)
+
+        def _cancel_timer():
+            timer = kick_info.get("timer")
+            if timer and not timer.done():
+                timer.cancel()
+
+        if emoji == "✅":
+            if member:
+                try:
+                    await member.kick(reason=kick_info["reason"])
+                    if mod_channel:
+                        await mod_channel.send(
+                            f"✅ Moderator confirmed kick for {member.display_name} (ID: {member.id})."
+                        )
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    log_body = (
+                        "**━━━━━━━━━━━━━━━━━━**\n"
+                        f"**User**: {member.display_name} | *{member.name}*\n"
+                        "**Offense**: Flagged by Automod | Exceeded Probation Points.\n"
+                        f"**Action Taken**: Kicked via moderator reaction ({kick_info['reason']}).\n"
+                        f"**Date/Time**: **{now.strftime('%Y-%m-%d')}** at **{now.strftime('%H:%M:%S')}** UTC"
+                    )
+                    await self.send_moderation_log(log_body, reaction.message)
+                    debug_print("DiscordBot", f"Moderator kick confirmed for user {member.name}.")
+                except Exception as exc:
+                    print(f"[ERROR] Failed to kick user {member.name if member else user_id}: {exc}")
+            _cancel_timer()
+            self.users_to_kick.pop(user_id, None)
+        elif emoji == "❌":
+            debug_print("DiscordBot", f"Kick cancelled for user ID {user_id} by moderator reaction.")
+            _cancel_timer()
+            self.users_to_kick.pop(user_id, None)
+            if member:
+                try:
+                    await member.timeout(None)
+                except Exception as exc:
+                    debug_print("DiscordBot", f"Failed to remove timeout for {member.name}: {exc}")
+            if mod_channel:
+                await mod_channel.send(
+                    f"❌ Kick cancelled for {member.display_name if member else user_id}. Automod monitoring paused."
+                )
 
     async def on_reaction_remove(self, reaction: discord.Reaction, user: discord.Member | discord.User):
+        if user.bot:
+            return
         if hasattr(user, 'nick'):
             name = user.nick
         else:
@@ -208,13 +276,15 @@ class DiscordBot:
             if referenced_message.author == self.bot.user:
                 await self.respond_to_reply(message, referenced_message)
                 return
-        timer = self._get_response_timer()
-        if timer is None:
-            debug_print("DiscordBot", "ResponseTimer unavailable; skipping message queue append.")
-            return
         if isinstance(message.channel, discord.DMChannel):
             debug_print("DiscordBot",f"Received DM from {message.author}: {message.content}")
             #Insert DM handling logic here
+            return
+        self._record_probation_activity(message)
+
+        timer = self._get_response_timer()
+        if timer is None:
+            debug_print("DiscordBot", "ResponseTimer unavailable; skipping message queue append.")
             return
         if not self.online_database:
             self.online_database = get_reference("OnlineDatabase")
@@ -252,20 +322,9 @@ class DiscordBot:
         await update_task
 
     async def handle_new_member(self, member: discord.Member | discord.User):
-        created_at: datetime.datetime = member.created_at
-        age_threshold_days = await get_setting("Discord New Account Age Threshold Days", 7)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        account_age = (now - created_at).days
-        debug_print("DiscordBot", f"New member {member.name} account age: {account_age} days")
-        if account_age < age_threshold_days:
-            debug_print("DiscordBot", f"Member {member.name} flagged as new account (age: {account_age} days)")
-            try:
-                guild = member.guild
-                await guild.kick(member, reason="New account age below threshold.")
-                debug_print("DiscordBot", f"Kicked member {member.name} for being a new account.")
-            except Exception as e:
-                print(f"[ERROR] Failed to kick member {member.name}: {e}")
-        pass
+        joined_at = datetime.datetime.now(datetime.timezone.utc)
+        self.probations[member.id] = Probation(member.id, joined_at, member)
+        debug_print("DiscordBot", f"New member {member.name} has joined and is now on probation with ID {member.id}.")
 
     async def handle_message_edit(self, message_id: int, author_display: str, new_content: str):
         timer = self._get_response_timer()
@@ -362,14 +421,79 @@ class DiscordBot:
             await interaction.response.send_message("You can find the quotes database here: http://bit.ly/4luynMp", ephemeral=True)
             debug_print("DiscordBot", f"Quotes command used by {interaction.user}.")
 
-        @self.bot.tree.command(name="settings", description="Change bot settings. Moderators and Owner only. To see list of settings, use !settings list.")
+        @self.bot.tree.command(name="settings", description="Change bot settings. Moderators and Owner only. To see list of settings don't provide any values.")
         @app_commands.describe(setting_name="The name of the setting to change.", setting_value="The new value for the setting.")
         async def settings(interaction: discord.Interaction, setting_name: str = None, setting_value: str = None):
-            if not self._authorized_user(interaction):
+            try:
+                if not self._authorized_user(interaction.user):
+                    await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+                    return
+                await self.handle_settings_command(interaction, setting_name, setting_value)
+            except Exception as exc:
+                await interaction.response.send_message(f"An error occurred while handling settings command: {exc}", ephemeral=True)
+                return
+            debug_print("DiscordBot", f"Settings command used by {interaction.user}.")
+
+        @self.bot.tree.command(name="probation_status", description="List probation users with rolling/total points (mods/owner only).")
+        async def probation_status(interaction: discord.Interaction):
+            try:
+                if not self._authorized_user(interaction.user):
+                    await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+                    return
+                if not self.probations:
+                    await interaction.response.send_message("No users are currently on probation.", ephemeral=True)
+                    return
+            except Exception as exc:
+                await interaction.response.send_message(f"An error occurred while fetching probation status: {exc}", ephemeral=True)
+                return
+            status_lines = []
+            for user_id, probation in self.probations.items():
+                member = self.bot.get_user(user_id)
+                display_name = (
+                    getattr(member, "display_name", None)
+                    or getattr(member, "global_name", None)
+                    or getattr(member, "name", None)
+                    or f"User ID {user_id}"
+                )
+                rolling_points = probation.get_rolling_points()
+                status_lines.append(
+                    f"{display_name}: {probation.total_points} total points, {rolling_points} rolling points (points in the last minute). "
+                    f"Probation ends at {probation.probation_end.strftime('%Y-%m-%d %H:%M') if probation.probation_end else 'N/A'} UTC."
+                )
+            await interaction.response.send_message("Current Probation Status:\n" + "\n".join(status_lines), ephemeral=True)
+        
+        @self.bot.tree.command(name="report", description=("Report a message for spam/bots. Provide a link/ID or use the Report Message context menu."))
+        @app_commands.describe(message_link="Optional message link or ID if not replying.", reason="Optional reason for the report.")
+        async def report(interaction: discord.Interaction, message_link: str | None = None, reason: str | None = None):
+            target_message = await self._resolve_report_target(interaction, message_link)
+            if not target_message:
+                await interaction.response.send_message(
+                    "Slash commands can't capture replies. Provide a valid message link/ID, use the Report Message context menu, or reply with !report.",
+                    ephemeral=True,
+                )
+                return
+            await self._handle_user_report(interaction, target_message, reason)
+
+        @self.bot.tree.context_menu(name="Report Message")
+        async def report_message(interaction: discord.Interaction, message: discord.Message):
+            await self._handle_user_report(interaction, message, None)
+
+        @self.bot.tree.command(name="remove_probation", description="Remove probation status from a user. Moderators and Owner only.")
+        async def remove_probation(interaction: discord.Interaction, user: discord.User):
+            if not self._authorized_user(interaction.user):
                 await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
                 return
-            await self.handle_settings_command(interaction, setting_name, setting_value)
-            debug_print("DiscordBot", f"Settings command used by {interaction.user}.")
+            removed = await self.remove_probation_entry(user.id)
+            if removed:
+                await interaction.response.send_message(
+                    f"Removed probation tracking for {getattr(user, 'display_name', None) or user.name}.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "That user is not currently on probation.",
+                    ephemeral=True,
+                )
 
     def _register_prefix_commands(self):
         @self.bot.command(name="askmaddie")
@@ -401,6 +525,29 @@ class DiscordBot:
         async def reload_command(ctx: commands.Context):
             debug_print("DiscordBot", f"reload command used by {ctx.author}.")
             await self.reload(ctx)
+
+        @self.bot.command(name="report")
+        async def report_command(ctx: commands.Context, *, reason: str | None = None):
+            if not ctx.message.reference:
+                await ctx.reply(
+                    "Reply to the message you want to report, then run !report <optional reason>.",
+                    mention_author=False,
+                )
+                return
+            target_message = await self._fetch_reference_message(ctx.message.reference, ctx.channel)
+            if not target_message:
+                await ctx.reply(
+                    "Couldn't resolve the referenced message. Please try again or use the Report Message context menu.",
+                    mention_author=False,
+                )
+                return
+            confirmation = await self._process_user_report(
+                reporter_display=ctx.author.display_name,
+                reporter_name=ctx.author.name,
+                target_message=target_message,
+                reason=reason,
+            )
+            await ctx.reply(confirmation, mention_author=False)
 
     async def refresh_slash_commands(self) -> dict[str, int]:
         """Forcefully remove and re-register all slash commands."""
@@ -697,40 +844,37 @@ class DiscordBot:
                 await ctx.message.reply(f"No quotes found containing the words: {search_terms}.", mention_author=False)
 
     async def handle_reload(self, ctx: commands.Context):
-        if self._authorized_user(ctx):
+        if self._authorized_user(ctx.author):
             await ctx.message.reply("Not implemented yet...", mention_author=False)
 
     async def handle_settings_command(self, interaction: discord.Interaction, setting_name: str = None, setting_value: str = None):
         """Parses and handles the settings command. Works with either the keyword 'list' or '<setting_name> <setting_value>'. Returns error message if value wrong data type."""
         settings: dict = await get_all_settings()
-        content = interaction.message.content[len("/settings"):].strip()
-        if content.lower() == "list":
-            settings_list = "\n".join([f"{key}: {value['value']} ({value['type']})" for key, value in settings.items()])
-            await interaction.response.send_message(f"Current Settings:\n{settings_list}", ephemeral=True)
-        else:
-            parts = content.split(" ", 1)
-            if len(parts) != 2:
-                await interaction.response.send_message("Invalid format. Use `/settings list` or `/settings <setting_name> <setting_value>`.", ephemeral=True)
-                return
-            setting_name = parts[0]
-            setting_value = parts[1]
-            if setting_name.lower() not in [key.lower() for key in settings.keys()]:
-                await interaction.response.send_message(f"Setting '{setting_name}' not found.", ephemeral=True)
-                return
-            expected_type = settings[setting_name]['type']
-            try:
-                if expected_type == "int":
-                    setting_value = int(setting_value)
-                elif expected_type == "float":
-                    setting_value = float(setting_value)
-                elif expected_type == "bool":
-                    setting_value = setting_value.lower() in ["true", "1", "yes", "on"]
-            except ValueError:
-                await interaction.response.send_message(f"Invalid value for setting '{setting_name}'. Expected type: {expected_type}.", ephemeral=True)
-                return
-            
-            await update_setting(setting_name, setting_value)
-            await interaction.response.send_message(f"Setting '{setting_name}' updated to '{setting_value}'.", ephemeral=True)
+        if not setting_name:
+            settings_list = "\n".join([f"{key} (type: {value['type']})" for key, value in settings.items()])
+            await interaction.response.send_message(f"Available settings:\n{settings_list}\n\nUse the command like this: /settings <setting_name> <setting_value>", ephemeral=True)
+            return
+        elif setting_name and not setting_value:
+            await interaction.response.send_message("Please provide a value for the setting. Usage: /settings <setting_name> <setting_value>", ephemeral=True)
+            return
+        matching_key = next((key for key in settings.keys() if key.lower() == setting_name.lower()), None)
+        if matching_key is None:
+            await interaction.response.send_message(f"Setting '{setting_name}' not found.", ephemeral=True)
+            return
+        expected_type = str(settings[matching_key]['type']).upper()
+        try:
+            if expected_type == "INTEGER":
+                setting_value = int(setting_value)
+            elif expected_type == "FLOAT":
+                setting_value = float(setting_value)
+            elif expected_type == "BOOL":
+                setting_value = setting_value.lower() in ["true", "1", "yes", "on"]
+        except ValueError:
+            await interaction.response.send_message(f"Invalid value for setting '{setting_name}'. Expected type: {expected_type}.", ephemeral=True)
+            return
+
+        await update_setting(matching_key, setting_value)
+        await interaction.response.send_message(f"Setting '{matching_key}' updated to '{setting_value}'.", ephemeral=True)
 
     # ------------------------------------------------------------------
     # Moderation
@@ -755,6 +899,80 @@ class DiscordBot:
         if matched_word:
             await self.moderation_delete_message(message, matched_word, message_content)
             return True
+        
+    async def kick_user(self, user_id: int, reason: str, messages_to_delete: list[int] = None):
+        """Deletes all messages from a user, sends a message to the mod chat channel for action. 
+        Waits five minutes for a response, then kicks the user if no action taken or if kick is specified. 
+        Uses reactions for moderators to specify action within the time limit. If messages_to_delete is provided, 
+        will attempt to delete those specific messages instead of all messages from the user."""
+        user = self.bot.get_user(user_id)
+        mod_channel_id = await get_setting("Discord Moderator Chat Channel ID", 0)
+        if user is None:
+            debug_print("DiscordBot", f"User with ID {user_id} not found for kicking.")
+            return
+        for guild in self.bot.guilds:
+            member = guild.get_member(user_id)
+            if member:
+                try:
+                    await member.timeout(discord.utils.utcnow() + datetime.timedelta(minutes=5), reason=reason)
+                    debug_print(
+                        "DiscordBot",
+                        f"Timed out user {member.name} from guild {guild.name} for 5 minutes for reason: {reason}",
+                    )
+                    mod_channel = None
+                    notification = None
+                    if mod_channel_id:
+                        try:
+                            mod_channel = await self.bot.fetch_channel(mod_channel_id)
+                            notification = await mod_channel.send(f"User {member.display_name} has been flagged for kicking: {reason}. React with ✅ to kick immediately, or ❌ to cancel.")
+                            await notification.add_reaction("✅")
+                            await notification.add_reaction("❌")
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                            print(
+                                f"[ERROR] Failed to send kick notification for user {member.name} in guild {guild.name}: {exc}"
+                            )
+                    existing = self.users_to_kick.get(user_id)
+                    if existing:
+                        timer = existing.get("timer")
+                        if timer and not timer.done():
+                            timer.cancel()
+                    timer_task = asyncio.create_task(self.kick_user_timer(member))
+                    channel_id = None
+                    if notification:
+                        channel_id = notification.channel.id
+                    elif mod_channel_id:
+                        channel_id = mod_channel_id
+                    self.users_to_kick[user_id] = {
+                        "notification_message_id": notification.id if notification else None,
+                        "channel_id": channel_id,
+                        "guild_id": guild.id,
+                        "timer": timer_task,
+                        "reason": reason,
+                    }
+                except Exception as e:
+                    print(f"[ERROR] Failed to kick user {member.name} from guild {guild.name}: {e}")
+        self.probations.pop(user_id, None)
+        if messages_to_delete:
+            for channel in self.bot.get_all_channels():
+                for message_id in messages_to_delete:
+                    try:
+                        message = await channel.fetch_message(message_id)
+                        if message.author.id == user_id:
+                            await message.delete()
+                            debug_print("DiscordBot", f"Deleted message ID {message_id} from user {user.name} in channel {channel.name}")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to delete message ID {message_id} from user {user.name} in channel {channel.name}: {e}")
+
+    async def kick_user_timer(self, member: discord.Member):
+        await asyncio.sleep(300)  # Wait 5 minutes
+        if member.id in self.users_to_kick:
+            try:
+                await member.kick(reason="Automatic kick after timeout for: " + self.users_to_kick[member.id]["reason"])
+                debug_print("DiscordBot", f"Automatically kicked user {member.name} after timeout for reason: {self.users_to_kick[member.id]['reason']}")
+            except Exception as e:
+                print(f"[ERROR] Failed to automatically kick user {member.name} from guild {member.guild.name}: {e}")
+            del self.users_to_kick[member.id]
+
 
     async def _fetch_banned_words(self):
         """Retrieve banned words on the DB loop when necessary."""
@@ -781,14 +999,14 @@ class DiscordBot:
         date_str = now.strftime("%m/%d/%Y")
         time_str = now.strftime("%I:%M %p")
         await message.delete()
-        await self.send_moderation_log(f"**━━━━━━━━━━━━━━━━━━**\n**User**: {message.author.display_name} | *{message.author.name}*\n**Offence**: Used banned word **{matched_word}** in **{message.channel.name}**\n**Original message**: {message_content}\n**Action Taken**: Deleted Message\n**Date/Time**: **{date_str}** at **{time_str}**", message)
+        await self.send_moderation_log(f"**━━━━━━━━━━━━━━━━━━**\n**User**: {message.author.display_name} | *{message.author.name}*\n**Offense**: Used banned word **{matched_word}** in **{message.channel.name}**\n**Original message**: {message_content}\n**Action Taken**: Deleted Message\n**Date/Time**: **{date_str}** at **{time_str}**", message)
 
     async def moderation_censored_word(self, message: discord.Message, matched_word, message_content): #Unused for now
         pst = self._resolve_timezone("PST")
         now = datetime.datetime.now(pst)
         date_str = now.strftime("%m/%d/%Y")
         time_str = now.strftime("%I:%M %p")
-        await self.send_moderation_log(f"**━━━━━━━━━━━━━━━━━━**\n**User**: {message.author.display_name} | *{message.author.name}*\n**Offence**: Used secret special word/phrase **{matched_word}** in **{message.channel.name}**\n**Original message**: {message_content}\n**Action Taken**: None\n**Date/Time**: **{date_str}** at **{time_str}**", message)
+        await self.send_moderation_log(f"**━━━━━━━━━━━━━━━━━━**\n**User**: {message.author.display_name} | *{message.author.name}*\n**Offense**: Used secret special word/phrase **{matched_word}** in **{message.channel.name}**\n**Original message**: {message_content}\n**Action Taken**: None\n**Date/Time**: **{date_str}** at **{time_str}**", message)
 
     async def send_moderation_log(self, message_to_send, message: discord.Message):
         mod_channel_id = await get_setting("Discord Moderation Logs Channel ID", 0)
@@ -927,9 +1145,9 @@ class DiscordBot:
 
         return datetime.timezone(datetime.timedelta(hours=offset_hours), name=tz_code)
 
-    def _authorized_user(self, ctx: commands.Context) -> bool:
+    def _authorized_user(self, user: discord.Member | discord.User) -> bool:
         """Check if the command invoker is the bot owner or a moderator."""
-        return ctx.author.guild_permissions.manage_channels or (self.owner_id and ctx.author.id == self.owner_id)
+        return user.guild_permissions.manage_channels or (self.owner_id and user.id == self.owner_id)
 
     def _get_response_timer(self):
         """Return a ResponseTimer instance with a message queue if available."""
@@ -943,6 +1161,243 @@ class DiscordBot:
             self.response_timer = timer
             return timer
         return None
+
+    def _record_probation_activity(self, message: discord.Message) -> None:
+        probation = self.probations.get(message.author.id)
+        if not probation:
+            return
+        summary, skip_risk, attachment_count = self._summarize_probation_message(message)
+        probation.add_message(
+            message.id,
+            summary,
+            message.created_at,
+            attachment_count=attachment_count,
+            skip_first_message_risk=skip_risk,
+        )
+
+    def _summarize_probation_message(self, message: discord.Message) -> tuple[str, bool, int]:
+        content = (message.content or "").strip()
+        attachments = list(message.attachments or [])
+        stickers = list(message.stickers or [])
+        parts: list[str] = []
+        if content:
+            parts.append(content)
+        if attachments:
+            names = ", ".join(attachment.filename for attachment in attachments[:3])
+            parts.append(f"Attachments: {names}")
+        if stickers:
+            sticker_names = ", ".join(sticker.name for sticker in stickers)
+            parts.append(f"Stickers: {sticker_names}")
+        summary = " | ".join(parts).strip()
+        has_meaningful_text = self._contains_meaningful_text(content)
+        skip_first_risk = not attachments and not has_meaningful_text
+        return (summary or content or ""), skip_first_risk, len(attachments)
+
+    def _contains_meaningful_text(self, text: str) -> bool:
+        if not text:
+            return False
+        normalized = CUSTOM_EMOJI_RE.sub("", text)
+        normalized = normalized.strip()
+        return any(char.isalnum() for char in normalized)
+
+    async def _fetch_reference_message(
+        self,
+        reference: discord.MessageReference | None,
+        fallback_channel: discord.abc.Messageable | None,
+    ) -> discord.Message | None:
+        if not reference:
+            return None
+        if reference.resolved:
+            return reference.resolved
+        channel = fallback_channel
+        if reference.channel_id and (not channel or getattr(channel, "id", None) != reference.channel_id):
+            channel = await self._get_text_channel(reference.channel_id)
+        if not channel or not reference.message_id:
+            return None
+        try:
+            return await channel.fetch_message(reference.message_id)
+        except Exception as exc:
+            debug_print("DiscordBot", f"Failed to fetch referenced message {reference.message_id}: {exc}")
+            return None
+
+    async def _resolve_report_target(
+        self,
+        interaction: discord.Interaction,
+        message_link: str | None,
+    ) -> discord.Message | None:
+        resolved_message = await self._message_from_resolved_payload(interaction)
+        if resolved_message:
+            return resolved_message
+        if message_link:
+            link_target = await self._message_from_link(interaction, message_link)
+            if link_target:
+                return link_target
+        reply_target = await self._message_from_reply_context(interaction)
+        return reply_target
+
+    async def _message_from_resolved_payload(
+        self, interaction: discord.Interaction
+    ) -> discord.Message | None:
+        data = getattr(interaction, "data", None)
+        if not isinstance(data, dict):
+            return None
+        resolved = data.get("resolved") or {}
+        messages = resolved.get("messages") or {}
+        if not messages:
+            return None
+        message_id, payload = next(iter(messages.items()))
+        channel_id = int(payload.get("channel_id", interaction.channel_id))
+        channel = await self._get_text_channel(channel_id)
+        if not channel:
+            return None
+        try:
+            return await channel.fetch_message(int(message_id))
+        except Exception as exc:
+            debug_print("DiscordBot", f"Failed to fetch resolved message {message_id}: {exc}")
+            return None
+
+    async def _message_from_link(
+        self, interaction: discord.Interaction, raw_link: str
+    ) -> discord.Message | None:
+        if not raw_link:
+            return None
+        raw_link = raw_link.strip()
+        channel_id = None
+        message_id = None
+        match = MESSAGE_LINK_RE.match(raw_link)
+        if match:
+            _, channel_str, message_str = match.groups()
+            channel_id = int(channel_str)
+            message_id = int(message_str)
+        elif raw_link.isdigit():
+            channel_id = interaction.channel_id
+            message_id = int(raw_link)
+        if channel_id is None or message_id is None:
+            return None
+        channel = await self._get_text_channel(channel_id)
+        if not channel:
+            return None
+        try:
+            return await channel.fetch_message(message_id)
+        except Exception as exc:
+            debug_print("DiscordBot", f"Failed to fetch message via link: {exc}")
+            return None
+
+    async def _message_from_reply_context(
+        self, interaction: discord.Interaction
+    ) -> discord.Message | None:
+        channel = getattr(interaction, "channel", None)
+        if not channel or not hasattr(channel, "history"):
+            return None
+        try:
+            async for recent in channel.history(limit=5):
+                if recent.author.id != interaction.user.id:
+                    continue
+                if not recent.reference:
+                    continue
+                resolved = await self._fetch_reference_message(recent.reference, channel)
+                if resolved:
+                    return resolved
+        except Exception as exc:
+            debug_print("DiscordBot", f"Failed to inspect reply context for report: {exc}")
+        return None
+
+    async def _get_text_channel(self, channel_id: int):
+        channel = self.bot.get_channel(channel_id)
+        if channel:
+            return channel
+        try:
+            return await self.bot.fetch_channel(channel_id)
+        except Exception as exc:
+            debug_print("DiscordBot", f"Failed to fetch channel {channel_id}: {exc}")
+            return None
+
+    async def _handle_user_report(
+        self,
+        interaction: discord.Interaction,
+        target_message: discord.Message,
+        reason: str | None,
+    ) -> None:
+        confirmation = await self._process_user_report(
+            reporter_display=interaction.user.display_name,
+            reporter_name=interaction.user.name,
+            target_message=target_message,
+            reason=reason,
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(confirmation, ephemeral=True)
+        else:
+            await interaction.response.send_message(confirmation, ephemeral=True)
+
+    async def _process_user_report(
+        self,
+        reporter_display: str,
+        reporter_name: str,
+        target_message: discord.Message,
+        reason: str | None,
+    ) -> str:
+        action_taken = "No action taken. Check legitimacy of the reported user."
+        probation = self.probations.get(target_message.author.id)
+        if probation:
+            probation.report_user()
+            action_taken = "Increased user's probation points. Check if further action is needed."
+        log_body = (
+            "**━━━━━━━━━━━━━━━━━━**\n"
+            f"**User**: {target_message.author.display_name} | *{target_message.author.name}*\n"
+            f"**Offense**: Reported by {reporter_display} | *{reporter_name}* as a bot/scam/spam.\n"
+            f"**Reason**: {reason if reason else 'No reason provided'}\n"
+            f"**Original message**: {target_message.content or '[No text provided]'}\n"
+            f"**Action Taken**: {action_taken}"
+        )
+        await self.send_moderation_log(log_body, target_message)
+        return "Report submitted to moderators."
+
+    async def get_probation_snapshot(self) -> List[Dict[str, Any]]:
+        snapshot: List[Dict[str, Any]] = []
+        for user_id, probation in self.probations.items():
+            member = None
+            for guild in self.bot.guilds:
+                member = guild.get_member(user_id)
+                if member:
+                    break
+            user_obj = member or self.bot.get_user(user_id)
+            username = getattr(user_obj, "name", None) if user_obj else None
+            display_name = (
+                getattr(user_obj, "display_name", None)
+                or getattr(user_obj, "global_name", None)
+                or username
+                or f"User ID {user_id}"
+            )
+            rolling_points = probation.get_rolling_points()
+            snapshot.append(
+                {
+                    "user_id": user_id,
+                    "username": username or display_name,
+                    "display_name": display_name,
+                    "rolling_points": rolling_points,
+                    "total_points": probation.total_points,
+                }
+            )
+        snapshot.sort(key=lambda entry: (entry["total_points"], entry["rolling_points"]), reverse=True)
+        return snapshot
+
+    async def remove_probation_entry(self, user_id: int) -> bool:
+        probation = self.probations.pop(user_id, None)
+        if probation:
+            probation.stop_decay()
+            debug_print("DiscordBot", f"Removed probation for user ID {user_id}")
+            return True
+        debug_print("DiscordBot", f"No probation found for user ID {user_id} to remove")
+        return False
+
+    async def reset_probation_points(self, user_id: int) -> bool:
+        probation = self.probations.get(user_id)
+        if probation is None:
+            debug_print("DiscordBot", f"No probation found for user ID {user_id} to reset")
+            return False
+        probation.reset_points()
+        debug_print("DiscordBot", f"Reset probation points for user ID {user_id}")
+        return True
 
 def main() -> None:
     async def runner() -> None:

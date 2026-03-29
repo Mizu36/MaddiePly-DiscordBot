@@ -10,3 +10,4 @@ data/
 build/
 settings.txt
 test_supabase_connection.py
+todo.txt

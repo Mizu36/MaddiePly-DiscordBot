@@ -265,6 +265,25 @@ class ChatGPT:
         print(f"{openai_answer}")
         return openai_answer
     
+    def check_first_message(self, message_content: str) -> str:
+        prompt = {"role": "system", "content": "The following message is a user's first message after joining a discord server. Determine the risk of the message being from a bot or malicious actor. Respond with 'LOW', 'MEDIUM', 'HIGH', or 'EXTREME'. Your response must be a single word, chosen from those options.\n\nMessage:\n" + message_content}
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.bot_detector_model or "gpt-4o-mini",
+                messages=[prompt],
+                temperature=0.0,
+                top_p=1.0,
+                presence_penalty=0.0,
+                frequency_penalty=0.0
+            )
+            risk = completion.choices[0].message.content.strip().upper()
+            if risk not in {"LOW", "MEDIUM", "HIGH", "EXTREME"}:
+                return "LOW"
+            return risk
+        except Exception as e:
+            print(f"Error during bot detection: {e}")
+            return "LOW"
+    
     def get_all_models(self):
         debug_print("OpenAIManager", "Fetching available OpenAI models.")
         return ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-5.1", "o3", "o3-mini", "o4-mini"]
