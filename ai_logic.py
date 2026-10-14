@@ -70,6 +70,13 @@ class AssistantManager():
         if not self.discord_bot:
             self.discord_bot = get_reference("DiscordBot")
         prompt = {"role": "user", "content": f"Current Time: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}\nDiscord Chat Messages:\n{messages_str}"}
+        response_prompt = await self.build_chat_response_prompt()
+        chatGPT = asyncio.to_thread(self.chatGPT.handle_chat, response_prompt, prompt)
+        response = await chatGPT
+        await self.discord_bot.send_chat(response)
+
+    async def build_chat_response_prompt(self) -> dict[str, str]:
+        """Build the shared chat prompt, including the occasional extra rules."""
         response_prompt = await get_prompt("Message Response Prompt")
         rules = []
         if random.randint(1, 100) <= 25:
@@ -79,11 +86,9 @@ class AssistantManager():
             rules = await get_random_prompt_rules(random_rules)
         if rules:
             rules_text = "\n".join([f"- {rule}" for rule in rules])
-            response_prompt += f"\n\nEXTA RULES (MANDATORY): \n- You must follow all rules listed here, in addition to the standard HARD OUTPUT RULES.\n- Apply them to your response fully.\n{rules_text}"
+            response_prompt += f"\n\nEXTRA RULES (MANDATORY): \n- You must follow all rules listed here, in addition to the standard HARD OUTPUT RULES.\n- Apply them to your response fully.\n{rules_text}"
             debug_print("Assistant", f"Applying extra rules to response prompt:\n{rules_text}")
-        chatGPT = asyncio.to_thread(self.chatGPT.handle_chat, {"role": "system", "content": response_prompt}, prompt)
-        response = await chatGPT
-        await self.discord_bot.send_chat(response)
+        return {"role": "system", "content": response_prompt}
 
     async def general_response(self, prompt: str) -> str:
         """Generates a general response from chatgpt based on a prompt"""
@@ -205,7 +210,8 @@ class ResponseTimer():
         self.db = DATABASE
         self.message_count = 0
         self.messages_to_process: list[dict] = []
-        self.received_messages: list[str] = []
+        self.received_messages: list[dict] = []
+        self.processing_messages: dict[int, dict] = {}
         self.assistant: AssistantManager = get_reference("AssistantManager")
         # Do NOT create asyncio tasks at import time (no running loop when GUI imports).
         # The timer can be started explicitly by calling start_timer() from
@@ -270,33 +276,51 @@ class ResponseTimer():
         while True:
             if self.messages_to_process:
                 message_data = self.messages_to_process.pop(0)
-                attached_images_descriptions = ""
-                if message_data["attachment_urls"]:
-                    if not self.chatGPT:
-                        self.chatGPT = get_reference("GPTManager")
-                    attachements = message_data["attachment_urls"]
-                    task_list = []
-                    for url in attachements: #Limit to first 3 images for performance
-                        if len(task_list) >= 3:
-                            break
-                        task_list.append(asyncio.to_thread(self.chatGPT.analyze_image, url))
-                    response_list = await asyncio.gather(*task_list)
-                    attached_images_descriptions = f"The message contains {len(response_list)} images."
-                    for i, desc in enumerate(response_list, start=1):
-                        attached_images_descriptions += f"\nImage Description {i}: {desc}"
-                else:
-                    pass
-                created_at_str = message_data["created_at"].strftime("%Y-%m-%d %H:%M:%S")
-                formatted_string = f"[{created_at_str}] {message_data['author_display'] or message_data['author_username']}: {message_data['content']}\n\n{attached_images_descriptions}"
-                message = {"id": message_data.get("message_id"), "content": formatted_string}
-                self.received_messages.append(message)
-                self.message_count += 1
-                await asyncio.sleep(0.1)
+                message_id = message_data.get("message_id")
+                if message_id is not None:
+                    self.processing_messages[message_id] = message_data
+                try:
+                    attached_images_descriptions = ""
+                    if message_data["attachment_urls"]:
+                        if not self.chatGPT:
+                            self.chatGPT = get_reference("GPTManager")
+                        task_list = [
+                            asyncio.to_thread(self.chatGPT.analyze_image, url)
+                            for url in message_data["attachment_urls"][:3]
+                        ]
+                        response_list = await asyncio.gather(*task_list)
+                        attached_images_descriptions = (
+                            f"The message contains {len(response_list)} images."
+                        )
+                        for i, desc in enumerate(response_list, start=1):
+                            attached_images_descriptions += f"\nImage Description {i}: {desc}"
+                    if message_data.get("_deleted"):
+                        continue
+                    created_at_str = message_data["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                    formatted_string = (
+                        f"[{created_at_str}] "
+                        f"{message_data['author_display'] or message_data['author_username']}: "
+                        f"{message_data['content']}\n\n{attached_images_descriptions}"
+                    )
+                    message = {"id": message_id, "content": formatted_string}
+                    self.received_messages.append(message)
+                    self.message_count += 1
+                    await asyncio.sleep(0.1)
+                finally:
+                    if message_id is not None:
+                        self.processing_messages.pop(message_id, None)
             else:
                 await asyncio.sleep(5)
 
     def remove_processed_message(self, message_id: int) -> None:
-        """Removes a message from the received messages list after it has been processed."""
+        """Remove a queued, processing, or received message from the response batch."""
+        for i, message in enumerate(self.messages_to_process):
+            if message.get("message_id") == message_id:
+                del self.messages_to_process[i]
+                break
+        processing_message = self.processing_messages.get(message_id)
+        if processing_message is not None:
+            processing_message["_deleted"] = True
         for i, msg in enumerate(self.received_messages):
             if msg.get("id") == message_id:
                 del self.received_messages[i]
@@ -304,25 +328,43 @@ class ResponseTimer():
                 break
 
     def edit_processed_message(self, message_id: int, display_name: str, new_content: str) -> None:
-        """Edits a message in the received messages list after it has been edited."""
+        """Update a message in any stage of the response batch."""
+        for message in self.messages_to_process:
+            if message.get("message_id") == message_id:
+                message["content"] = new_content
+                message["author_display"] = display_name
+        processing_message = self.processing_messages.get(message_id)
+        if processing_message is not None:
+            processing_message["content"] = new_content
+            processing_message["author_display"] = display_name
         for i, msg in enumerate(self.received_messages):
             if msg.get("id") == message_id:
                 created_at_str = ""
-                content_parts = msg.get("content", "").split("]: ", 1)
-                if len(content_parts) == 2:
-                    timestamp_part = content_parts[0].lstrip("[")
+                prior_content = msg.get("content", "")
+                header, separator, prior_body = prior_content.partition("] ")
+                details = ""
+                if separator:
+                    details = prior_body.partition("\n\n")[2]
                     try:
-                        timestamp = datetime.datetime.strptime(timestamp_part, "%Y-%m-%d %H:%M:%S")
+                        timestamp = datetime.datetime.strptime(
+                            header.lstrip("["), "%Y-%m-%d %H:%M:%S"
+                        )
                         created_at_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
                     except ValueError:
                         created_at_str = ""
                 formatted_string = f"[{created_at_str}] {display_name}: {new_content}"
+                if details:
+                    formatted_string += f"\n\n{details}"
                 self.received_messages[i]["content"] = formatted_string
                 break
         
     def get_progress_snapshot(self) -> tuple[int, int]:
         """Return a tuple of (messages_received, target_messages)."""
-        received = len(self.received_messages) + len(self.messages_to_process)
+        received = (
+            len(self.received_messages)
+            + len(self.messages_to_process)
+            + len(self.processing_messages)
+        )
         target = self._target_message_count
         return received, target
 

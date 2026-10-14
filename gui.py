@@ -24,8 +24,6 @@ ROW_STRIPE_DARK = "#f6f6f6"
 
 COMBO_SETTING_KEYS = {
     "Default OpenAI Model",
-    "Fine-tune GPT Model",
-    "Fine-tune Bot Detection Model",
 }
 
 AUDIO_DEVICES: list[str] = []
@@ -281,7 +279,7 @@ class DBEditor(tk.Tk):
             except Exception as exc:
                 debug_print("GUI", f"Error fetching OpenAI models: {exc}")
         if not models:
-            models.extend(["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "gpt-5"])
+            models.extend(["gpt-6-luna", "gpt-5.6-luna"])
         seen: set[str] = set()
         deduped: list[str] = []
         for model in models:

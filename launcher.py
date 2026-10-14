@@ -152,6 +152,7 @@ def ensure_local_database_ready() -> None:
 	for _ in range(200):
 		if get_database_loop() is not None:
 			log_startup("DATABASE_LOOP detected")
+			load_debug_setting()
 			return
 		time.sleep(0.05)
 	log_startup("Database event loop failed to initialize within timeout")
@@ -172,6 +173,16 @@ def get_setting_sync(key: str, default=None):
 	"""Helper to fetch settings from synchronous code."""
 
 	return run_on_db_loop(get_setting(key, default))
+
+
+def load_debug_setting() -> None:
+	"""Apply the persisted debug setting after the database loop is ready."""
+
+	debug_enabled = get_setting_sync("Debug Mode", False)
+	if not isinstance(debug_enabled, bool):
+		raise TypeError("Debug Mode setting must be a boolean.")
+	set_debug(debug_enabled)
+	log_startup(f"Debug mode loaded from database: {debug_enabled}")
 
 
 def wait_for_reference(name: str, *, timeout: float = 30.0):
@@ -320,7 +331,6 @@ def launch_gui() -> None:
 def main() -> None:
 	log_startup("launcher.main starting")
 	ensure_local_database_ready()
-	set_debug(True)
 	launch_gui()
 	log_startup("launcher.main exited")
 

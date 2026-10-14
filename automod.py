@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 import re
+from collections.abc import Awaitable, Callable
+from typing import Any
 import discord
 import asyncio
 from tools import get_reference
@@ -7,12 +11,19 @@ from tools import get_reference
 class Probation():
     prohibited_links = ["bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "t.co", "is.gd", "buff.ly", "adf.ly", "bit.do", "cutt.ly"]
 
-    def __init__(self, user_id, datetime_joined: datetime, member: discord.Member | discord.User):
+    def __init__(
+        self,
+        user_id: int,
+        datetime_joined: datetime,
+        member: discord.Member | discord.User | None,
+        persist_callback: Callable[[Probation], Awaitable[None]] | None = None,
+    ):
         self.user_id = user_id
         self.datetime_joined = datetime_joined
         self.probation_end = datetime_joined + timedelta(days=7)
         self.is_first_message = True
         self.member = member
+        self.persist_callback = persist_callback
         self.total_points = 0
         self.rolling_points = 0
         self.message_ids = []
@@ -20,8 +31,61 @@ class Probation():
         self.history = {}
         self.decay_task: asyncio.Task | None = None
         self.resting_points = 0
-        self.check_age()
+        if member is not None:
+            self.check_age()
         self._start_decay_timer()
+
+    @classmethod
+    def from_state(
+        cls,
+        user_id: int,
+        state: dict[str, Any],
+        persist_callback: Callable[[Probation], Awaitable[None]] | None = None,
+    ) -> Probation:
+        joined_at = datetime.fromisoformat(state["datetime_joined"])
+        probation = cls(user_id, joined_at, None, persist_callback)
+        probation.probation_end = datetime.fromisoformat(state["probation_end"])
+        probation.is_first_message = bool(state["is_first_message"])
+        probation.total_points = int(state["total_points"])
+        probation.resting_points = int(state["resting_points"])
+        probation.message_ids = list(state["message_ids"])
+        probation.message_contents = list(state["message_contents"])
+        probation.history = {
+            key: {
+                "content": entry["content"],
+                "timestamp": datetime.fromisoformat(entry["timestamp"]),
+                "points": int(entry["points"]),
+            }
+            for key, entry in state["history"].items()
+        }
+        return probation
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "datetime_joined": self.datetime_joined.isoformat(),
+            "probation_end": self.probation_end.isoformat(),
+            "is_first_message": self.is_first_message,
+            "total_points": self.total_points,
+            "resting_points": self.resting_points,
+            "message_ids": self.message_ids,
+            "message_contents": self.message_contents,
+            "history": {
+                str(key): {
+                    "content": entry["content"],
+                    "timestamp": entry["timestamp"].isoformat(),
+                    "points": entry["points"],
+                }
+                for key, entry in self.history.items()
+            },
+        }
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        current_time = now or datetime.now(timezone.utc)
+        return current_time >= self.probation_end
+
+    async def _persist(self) -> None:
+        if self.persist_callback:
+            await self.persist_callback(self)
 
     def _start_decay_timer(self):
         try:
@@ -42,7 +106,7 @@ class Probation():
         if account_age < 3:
             self.total_points += 5 #points for account less than 3 days old
 
-    def add_message(self, message_id, message_content, message_time, *, attachment_count: int = 0, skip_first_message_risk: bool = False):
+    async def add_message(self, message_id, message_content, message_time, *, attachment_count: int = 0, skip_first_message_risk: bool = False):
         points_received = 1  # standard point for sending a message
         if self.is_first_message:
             if attachment_count > 1:
@@ -54,7 +118,9 @@ class Probation():
             else:
                 self.is_first_message = False
                 chat_gpt = get_reference("GPTManager")
-                risk = chat_gpt.check_first_message(message_content)
+                risk = await asyncio.to_thread(
+                    chat_gpt.check_first_message, message_content
+                )
                 if risk == "MEDIUM":
                     points_received += 3
                     self.resting_points += 3 # set resting points to medium risk level for medium risk first message
@@ -88,9 +154,10 @@ class Probation():
             "points": points_received,
         }
         self.total_points += points_received
+        await self._persist()
         self._evaluate_thresholds()
             
-    def check_similarity(self, new_message_content) -> bool:
+    def check_similarity(self, new_message_content: str) -> tuple[bool, int]:
         count = 0
         similar = False
         for content in self.message_contents:
@@ -106,7 +173,7 @@ class Probation():
             return 0.0
         return len(a_words.intersection(b_words)) / len(a_words.union(b_words))
     
-    def report_user(self):
+    async def report_user(self):
         report_time = datetime.now(timezone.utc)
         self.total_points += 5 #points for being reported by a user
         self.resting_points += 5 #increase resting points for being reported by a user
@@ -115,12 +182,14 @@ class Probation():
             "timestamp": report_time,
             "points": 5,
         }
+        await self._persist()
         self._evaluate_thresholds()
 
     async def decay_timer_task(self):
         while True:
             await asyncio.sleep(600) #decay points every ten minutes
             self.total_points = max(self.resting_points, self.total_points - 1)
+            await self._persist()
 
     def get_rolling_points(self) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -132,12 +201,13 @@ class Probation():
     def check_rolling_points(self):
         return self.get_rolling_points() >= 15
 
-    def reset_points(self):
+    async def reset_points(self):
         self.history.clear()
         self.message_ids.clear()
         self.message_contents.clear()
         self.total_points = self.resting_points
         self.rolling_points = 0
+        await self._persist()
 
     def _evaluate_thresholds(self):
         if self.resting_points >= 20:
@@ -149,7 +219,10 @@ class Probation():
 
     def _schedule_kick(self, reason: str):
         discord_bot = get_reference("DiscordBot")
-        asyncio.create_task(discord_bot.kick_user(self.user_id, reason))
+        discord_bot.create_background_task(
+            discord_bot.kick_user(self.user_id, reason),
+            f"probation-kick-{self.user_id}",
+        )
 
 
 

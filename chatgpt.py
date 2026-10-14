@@ -25,8 +25,6 @@ class ChatGPT:
         self.api_key = os.getenv("CHATGPT_API_KEY")
         self.working_memory = ""
         self.default_model = None
-        self.fine_tuned_model = None
-        self.bot_detector_model = None
         self.opener_tracker = OpenerTracker()
         self.assistant = get_reference("AssistantManager")
         try:
@@ -39,8 +37,6 @@ class ChatGPT:
         #Placeholder for database call to get settings
         debug_print("OpenAIManager", "Fetching OpenAI models from settings.")
         self.default_model = await get_setting("Default OpenAI Model")
-        self.fine_tune_model = await get_setting("Fine-tune GPT Model")
-        self.bot_detector_model = await get_setting("Fine-tune Bot Detection Model")
 
     async def prepare_history(self):
         """Prepares all chat histories and system prompts."""
@@ -51,22 +47,16 @@ class ChatGPT:
         self.prompts = [{"role": "system", "content": self.personality_prompt}, {"role": "system", "content": self.global_output_rules}]
         self.discord_emotes_prompt = {"role": "system", "content": await get_prompt("Discord Emotes")}
 
-    def get_all_models(self):
-        debug_print("OpenAIManager", "Fetching available OpenAI models.")
-        return ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-5.1", "o3", "o3-mini", "o4-mini"]
-    
     def summarize_memory(self, recent_interaction: str) -> None:
         debug_print("OpenAIManager", "Summarizing recent interactions into long-term memory.")
         prompt = {"role": "system", "content": f"CURRENT MEMORY:\n{self.working_memory if self.working_memory else 'NONE'}\n\nRECENT EVENTS (RAW):\n{recent_interaction}"}
         messages = [{"role": "system", "content": self.personality_prompt}, self.memory_summarization_prompt, prompt]
         try:
             completion = self.client.chat.completions.create(
-                            model="gpt-4o-mini",
+                            model="gpt-6-luna",
                             messages=messages,
+                            reasoning_effort="none",
                             temperature=0.3,
-                            top_p=0.8,
-                            presence_penalty=0.0,
-                            frequency_penalty=0.0
                             )
             openai_answer = completion.choices[0].message.content
             debug_print("OpenAIManager", f"Memory summarization response: {openai_answer}")
@@ -151,27 +141,21 @@ class ChatGPT:
             context_prompt,
             self.tool_prompt
         ]
-        print("Asking ChatGPT for tool selection...")
+        debug_print("OpenAIManager", "Asking ChatGPT for tool selection...")
         # Process the answer
         try:
             completion = self.client.chat.completions.create(
-                            model="gpt-4o-mini",
+                            model="gpt-6-luna",
                             messages=messages,
-                            temperature=0.0,
-                            top_p=1.0,
-                            presence_penalty=0.0,
-                            frequency_penalty=0.0
+                            reasoning_effort="none",
+                            temperature=0.0
                             )
         except Exception:
             try:
                 completion = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=messages,
-                    temperature=0.0,
-                    top_p=1.0,
-                    presence_penalty=0.0,
-                    frequency_penalty=0.0
-                    )
+                    model="gpt-5.6-luna",
+                    messages=messages
+                )
             except Exception as e:
                 print(f"[ERROR]Failed to get response from OpenAI: {e}")
                 return {"tool": "NONE", "argument": None}
@@ -197,11 +181,10 @@ class ChatGPT:
         prompts.insert(1, working_memory_prompt)
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.default_model or "gpt-6-luna",
                 messages=prompts,
-                temperature=0.7,
-                frequency_penalty=0.7,
-                presence_penalty=0.4
+                reasoning_effort="none",
+                temperature=0.7
             )
             content = response.choices[0].message.content
             self.opener_tracker.record(content)
@@ -224,12 +207,12 @@ class ChatGPT:
                 return
             content_type = response.headers.get('content-type')
 
-            print("Asking ChatGPT to analyze a local image...")
+            debug_print("OpenAIManager", "Asking ChatGPT to analyze a local image...")
 
             base64_image = base64.b64encode(response.content).decode("utf-8")
 
             completion = self.client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-6-luna",
                 messages=[
                     {
                         "role": "system",
@@ -262,19 +245,17 @@ class ChatGPT:
 
         # Process the answer
         openai_answer = completion.choices[0].message.content
-        print(f"{openai_answer}")
+        debug_print("OpenAIManager", f"{openai_answer}")
         return openai_answer
     
     def check_first_message(self, message_content: str) -> str:
         prompt = {"role": "system", "content": "The following message is a user's first message after joining a discord server. Determine the risk of the message being from a bot or malicious actor. Respond with 'LOW', 'MEDIUM', 'HIGH', or 'EXTREME'. Your response must be a single word, chosen from those options.\n\nMessage:\n" + message_content}
         try:
             completion = self.client.chat.completions.create(
-                model=self.bot_detector_model or "gpt-4o-mini",
+                model="gpt-6-luna",
                 messages=[prompt],
-                temperature=0.0,
-                top_p=1.0,
-                presence_penalty=0.0,
-                frequency_penalty=0.0
+                reasoning_effort="none",
+                temperature=0.0
             )
             risk = completion.choices[0].message.content.strip().upper()
             if risk not in {"LOW", "MEDIUM", "HIGH", "EXTREME"}:
@@ -285,8 +266,20 @@ class ChatGPT:
             return "LOW"
     
     def get_all_models(self):
-        debug_print("OpenAIManager", "Fetching available OpenAI models.")
-        return ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro", "gpt-5.1", "o3", "o3-mini", "o4-mini"]
+        """Return available numbered GPT chat models, excluding specialized APIs."""
+        debug_print("OpenAIManager", "Fetching available OpenAI chat models.")
+        specialized_model_pattern = re.compile(
+            r"(?:^|-)(?:audio|realtime|tts|transcribe|transcription|image|"
+            r"embedding|moderation|codex|deep-research|computer-use|search)(?:-|$)"
+        )
+        model_pattern = re.compile(r"^gpt-\d+(?:\.\d+)?o?(?:-|$)")
+        models = {
+            model.id
+            for model in self.client.models.list()
+            if model_pattern.match(model.id.lower())
+            and not specialized_model_pattern.search(model.id.lower())
+        }
+        return sorted(models)
     
     def _parse_tool_response(self, response: str | None) -> dict | None:
         if not response:
@@ -329,7 +322,7 @@ class ChatGPT:
             ),
         }
         completion = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-6-luna",
             messages=[prompt, context_prompt],
         )
         content = completion.choices[0].message.content or ""

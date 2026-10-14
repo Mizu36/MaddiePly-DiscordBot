@@ -1,29 +1,29 @@
-from email.mime import message
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from tools import path_from_storage_root, set_reference, set_debug, get_reference, debug_print
+from tools import set_reference, get_reference, debug_print
 from local_database import (
-    setup_database,
     get_setting,
     get_prompt,
     get_banned_words,
     get_all_settings,
     update_setting,
     get_database_loop,
-    add_policy
+    add_policy,
+    get_probation_states,
+    save_probation_state,
+    delete_probation_state,
 )
-from ai_logic import setup_gpt_manager
 from google_api import GoogleSheets
 from automod import Probation
-import os
 import asyncio
-import asqlite
+import os
+import threading
 import discord
 import datetime
 from random import randint, choice
 from discord.ext import commands
 from discord import app_commands
-from typing import Any, Dict, List
+from typing import Any, Coroutine, Dict, List
 
 
 MESSAGE_LINK_RE = re.compile(r"https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/(\d+|@me)/(\d+)/(\d+)")
@@ -37,6 +37,8 @@ class DiscordBot:
         self.google_sheets: GoogleSheets = get_reference("GoogleSheets")
         self.owner_id = None
         self.owner_name = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._probation_expiry_task: asyncio.Task | None = None
         self.token = token
         self.prefix = prefix
         self.prefix_commands = [
@@ -117,6 +119,11 @@ class DiscordBot:
         self.owner_name = await get_setting("Owner Name", "None")
         self.general_channel_id = await get_setting("Discord General Channel ID", 0)
         debug_print("DiscordBot", f"Owner set to {self.owner_name} (ID: {str(self.owner_id)})")
+        await self._restore_probations()
+        if self._probation_expiry_task is None or self._probation_expiry_task.done():
+            self._probation_expiry_task = self.create_background_task(
+                self._probation_expiry_loop(), "probation-expiry"
+            )
         try:
             await self._clear_guild_scoped_commands()
             synced = await self.bot.tree.sync()
@@ -150,7 +157,9 @@ class DiscordBot:
     async def _on_message_listener(self, message: discord.Message):
         if message.author == self.bot.user:
             return
-        asyncio.create_task(self.handle_message(message))
+        self.create_background_task(
+            self.handle_message(message), f"handle-message-{message.id}"
+        )
 
     async def on_disconnect(self):
         debug_print("DiscordBot", "Bot disconnected.")
@@ -168,7 +177,9 @@ class DiscordBot:
         else:
             name = member.name
         debug_print("DiscordBot", f"Member joined: {name} (ID: {member.id})")
-        asyncio.create_task(self.handle_new_member(member))
+        self.create_background_task(
+            self.handle_new_member(member), f"new-member-{member.id}"
+        )
         # Further member join handling logic goes here
 
     async def on_member_remove(self, member: discord.Member | discord.User):
@@ -252,11 +263,20 @@ class DiscordBot:
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         debug_print("DiscordBot", f"Message edited by {before.author} from '{before.content}' to '{after.content}'")
-        asyncio.create_task(self.handle_message_edit(before.id, before.author.nick or before.author.name, after.content))
+        self.create_background_task(
+            self.handle_message_edit(
+                before.id,
+                before.author.display_name,
+                after.content,
+            ),
+            f"message-edit-{before.id}",
+        )
     
     async def on_message_delete(self, message: discord.Message):
         debug_print("DiscordBot", f"Message deleted by {message.author}: {message.content}")
-        asyncio.create_task(self.handle_message_delete(message.id))
+        self.create_background_task(
+            self.handle_message_delete(message.id), f"message-delete-{message.id}"
+        )
     
 
     # ------------------------------------------------------------------
@@ -271,16 +291,17 @@ class DiscordBot:
             debug_print("DiscordBot", f"Message from {message.author} exceeded max length and was ignored.")
             return
         if message.reference:
-            reference_message_id = message.reference.message_id
-            referenced_message = await message.channel.fetch_message(reference_message_id)
-            if referenced_message.author == self.bot.user:
+            referenced_message = await self._fetch_reference_message(
+                message.reference, message.channel
+            )
+            if referenced_message and referenced_message.author == self.bot.user:
                 await self.respond_to_reply(message, referenced_message)
                 return
         if isinstance(message.channel, discord.DMChannel):
             debug_print("DiscordBot",f"Received DM from {message.author}: {message.content}")
             #Insert DM handling logic here
             return
-        self._record_probation_activity(message)
+        await self._record_probation_activity(message)
 
         timer = self._get_response_timer()
         if timer is None:
@@ -290,7 +311,12 @@ class DiscordBot:
             self.online_database = get_reference("OnlineDatabase")
         if not await self.online_database.user_exists(str(message.author.id)):
             await self.online_database.create_user(str(message.author.id), {"discord_username": message.author.name, "discord_display_name": message.author.nick or message.author.name, "discord_currency": 500, "active_gacha_set": "humble beginnings"})
-        update_task = asyncio.create_task(self.online_database.handle_message_update(str(message.author.id), message.author.nick))
+        update_task = self.create_background_task(
+            self.online_database.handle_message_update(
+                str(message.author.id), message.author.nick
+            ),
+            f"message-update-{message.author.id}",
+        )
         content: str = message.content or ""
         if "hey maddie" in content.lower():
             await self.handle_askmaddie(message)
@@ -322,8 +348,13 @@ class DiscordBot:
         await update_task
 
     async def handle_new_member(self, member: discord.Member | discord.User):
+        current_probation = self.probations.get(member.id)
+        if current_probation and not current_probation.is_expired():
+            return
+        if current_probation:
+            await self.remove_probation_entry(member.id)
         joined_at = datetime.datetime.now(datetime.timezone.utc)
-        self.probations[member.id] = Probation(member.id, joined_at, member)
+        await self._create_probation(member.id, joined_at, member)
         debug_print("DiscordBot", f"New member {member.name} has joined and is now on probation with ID {member.id}.")
 
     async def handle_message_edit(self, message_id: int, author_display: str, new_content: str):
@@ -355,13 +386,22 @@ class DiscordBot:
             if not self.online_database:
                 self.online_database = get_reference("OnlineDatabase")
             user_id = str(interaction.user.id)
-            current_currency = 0
             try:
                 value = await self.online_database.get_specific_user_data(user_id, "discord_currency")
-                if value is not None:
-                    current_currency = value
             except Exception as exc:
                 debug_print("DiscordBot", f"Currency lookup failed for {user_id}: {exc}")
+                await interaction.response.send_message(
+                    "Your balance is temporarily unavailable. Please try again later.",
+                    ephemeral=True,
+                )
+                return
+            if value is None:
+                await interaction.response.send_message(
+                    "No currency balance is available for your account yet.",
+                    ephemeral=True,
+                )
+                return
+            current_currency = value
             await interaction.response.send_message(f"You currently have {current_currency} ModdBucks.", ephemeral=True)
             debug_print("DiscordBot", f"Currency command used by {interaction.user}.")
 
@@ -440,6 +480,7 @@ class DiscordBot:
                 if not self._authorized_user(interaction.user):
                     await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
                     return
+                await self._expire_probations()
                 if not self.probations:
                     await interaction.response.send_message("No users are currently on probation.", ephemeral=True)
                     return
@@ -447,7 +488,10 @@ class DiscordBot:
                 await interaction.response.send_message(f"An error occurred while fetching probation status: {exc}", ephemeral=True)
                 return
             status_lines = []
-            for user_id, probation in self.probations.items():
+            for user_id, probation in list(self.probations.items()):
+                if probation.is_expired():
+                    await self.remove_probation_entry(user_id)
+                    continue
                 member = self.bot.get_user(user_id)
                 display_name = (
                     getattr(member, "display_name", None)
@@ -478,22 +522,32 @@ class DiscordBot:
         async def report_message(interaction: discord.Interaction, message: discord.Message):
             await self._handle_user_report(interaction, message, None)
 
-        @self.bot.tree.command(name="remove_probation", description="Remove probation status from a user. Moderators and Owner only.")
+        @self.bot.tree.context_menu(name="Put on Probation")
+        async def put_on_probation(interaction: discord.Interaction, user: discord.User):
+            if not self._authorized_user(interaction.user):
+                await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+                return
+            existing_probation = self.probations.get(user.id)
+            if existing_probation and existing_probation.is_expired():
+                await self.remove_probation_entry(user.id)
+                existing_probation = None
+            if existing_probation:
+                await interaction.response.send_message(f"{getattr(user, 'display_name', None) or user.name} is already on probation.", ephemeral=True)
+                return
+            joined_at = datetime.datetime.now(datetime.timezone.utc)
+            await self._create_probation(user.id, joined_at, user)
+            await interaction.response.send_message(f"{getattr(user, 'display_name', None) or user.name} has been put on probation.", ephemeral=True)
+
+        @self.bot.tree.context_menu(name="Remove from Probation")
         async def remove_probation(interaction: discord.Interaction, user: discord.User):
             if not self._authorized_user(interaction.user):
                 await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
                 return
             removed = await self.remove_probation_entry(user.id)
             if removed:
-                await interaction.response.send_message(
-                    f"Removed probation tracking for {getattr(user, 'display_name', None) or user.name}.",
-                    ephemeral=True,
-                )
+                await interaction.response.send_message(f"Removed probation tracking for {getattr(user, 'display_name', None) or user.name}.", ephemeral=True)
             else:
-                await interaction.response.send_message(
-                    "That user is not currently on probation.",
-                    ephemeral=True,
-                )
+                await interaction.response.send_message("That user is not currently on probation.", ephemeral=True)
 
     def _register_prefix_commands(self):
         @self.bot.command(name="askmaddie")
@@ -571,19 +625,28 @@ class DiscordBot:
 
     async def askmaddie(self, ctx: commands.Context):
         """Responds to user's message and takes in context including attachments and parent message if is reply."""
-        asyncio.create_task(self.handle_askmaddie(message=ctx.message))
+        self.create_background_task(
+            self.handle_askmaddie(message=ctx.message),
+            f"askmaddie-{ctx.message.id}",
+        )
 
     async def clapback(self, ctx: commands.Context):
         """MaddiePly will roast the user."""
-        asyncio.create_task(self.handle_clapback(message=ctx.message))
+        self.create_background_task(
+            self.handle_clapback(message=ctx.message),
+            f"clapback-{ctx.message.id}",
+        )
     
     async def policy(self, ctx: commands.Context):
         """MaddiePly will provide information on policies regarding the subject."""
-        asyncio.create_task(self.handle_policy(message=ctx.message))
+        self.create_background_task(
+            self.handle_policy(message=ctx.message),
+            f"policy-{ctx.message.id}",
+        )
 
     async def quote(self, ctx: commands.Context):
         """Retrieve a specific quote by ID."""
-        asyncio.create_task(self.handle_quote(ctx))
+        self.create_background_task(self.handle_quote(ctx), f"quote-{ctx.message.id}")
 
     async def game(self, ctx: commands.Context):
         """Returns with active game."""
@@ -673,16 +736,73 @@ class DiscordBot:
         await message.reply(response, mention_author=False)
 
     async def respond_to_reply(self, message: discord.Message, referenced_message: discord.Message):
-        #Insert reply handling logic here, similar to handle_askmaddie but with a different system prompt and possibly different context construction
+        if not self.chatGPT:
+            self.chatGPT = get_reference("GPTManager")
+
+        assistant = get_reference("AssistantManager")
+        if assistant is None:
+            raise RuntimeError("AssistantManager is unavailable for reply generation.")
+
         new_message_content = message.content.strip()
         referenced_message_content = referenced_message.content.strip() if referenced_message.content else ""
-        reply_prompt = {"role": "system", "content": await get_prompt("Respond to Reply Prompt")}
-        context_prompt = {"role": "user", "content": f"Original message:\nYou: {referenced_message_content}\nReply:\n{message.author.nick or message.author.name}: {new_message_content}"}
-        response = await asyncio.to_thread(self.chatGPT.handle_chat, reply_prompt, context_prompt)
+        author_name = message.author.nick or message.author.name
+        image_threads = []
+        for attachment in message.attachments:
+            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                image_threads.append(
+                    asyncio.to_thread(self.chatGPT.analyze_image, attachment.url)
+                )
+                if len(image_threads) >= 3:
+                    break
+
+        original_image_threads = []
+        for attachment in referenced_message.attachments:
+            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                original_image_threads.append(
+                    asyncio.to_thread(self.chatGPT.analyze_image, attachment.url)
+                )
+                if len(original_image_threads) >= 3:
+                    break
+
+        image_descriptions = [
+            description
+            for description in await asyncio.gather(*image_threads)
+            if description
+        ]
+        original_image_descriptions = [
+            description
+            for description in await asyncio.gather(*original_image_threads)
+            if description
+        ]
+        context_parts = [
+            f"Original message from MaddiePly:\n{referenced_message_content or '(no text)'}",
+            f"Latest reply from {author_name}:\n{new_message_content or '(no text)'}",
+        ]
+        if original_image_descriptions:
+            context_parts.append(
+                f"Images in MaddiePly's original message: {'; '.join(original_image_descriptions)}"
+            )
+        if image_descriptions:
+            context_parts.append(
+                f"Images in the latest reply: {'; '.join(image_descriptions)}"
+            )
+        context_prompt = {"role": "user", "content": "\n\n".join(context_parts)}
+        response_prompt = await assistant.build_chat_response_prompt()
+        reply_prompt = await get_prompt("Respond to Reply Prompt")
+        response_prompt["content"] += (
+            f"\n\n{reply_prompt}"
+            "\n\nREPLY CONTEXT:\n"
+            "Respond to the user's latest message as a natural continuation of the conversation. "
+            "Use the earlier MaddiePly message for context; do not force an explicit acknowledgment "
+            "that the user replied. The standard chat response prompt's voice, sentence-opening, "
+            "length, output, and emote rules take precedence over any conflicting reply-specific rules."
+        )
+        response = await asyncio.to_thread(
+            self.chatGPT.handle_chat, response_prompt, context_prompt
+        )
         await message.reply(response, mention_author=False)
 
     async def handle_clapback(self, message: discord.Message):
-        #Insert clapback handling logic here
         message_parts = []
         attachment_urls = []
         parent_attachment_urls = []
@@ -936,7 +1056,9 @@ class DiscordBot:
                         timer = existing.get("timer")
                         if timer and not timer.done():
                             timer.cancel()
-                    timer_task = asyncio.create_task(self.kick_user_timer(member))
+                    timer_task = self.create_background_task(
+                        self.kick_user_timer(member), f"kick-timer-{member.id}"
+                    )
                     channel_id = None
                     if notification:
                         channel_id = notification.channel.id
@@ -951,7 +1073,7 @@ class DiscordBot:
                     }
                 except Exception as e:
                     print(f"[ERROR] Failed to kick user {member.name} from guild {guild.name}: {e}")
-        self.probations.pop(user_id, None)
+        await self.remove_probation_entry(user_id)
         if messages_to_delete:
             for channel in self.bot.get_all_channels():
                 for message_id in messages_to_delete:
@@ -1147,7 +1269,91 @@ class DiscordBot:
 
     def _authorized_user(self, user: discord.Member | discord.User) -> bool:
         """Check if the command invoker is the bot owner or a moderator."""
-        return user.guild_permissions.manage_channels or (self.owner_id and user.id == self.owner_id)
+        is_moderator = (
+            isinstance(user, discord.Member) and user.guild_permissions.kick_members
+        )
+        return is_moderator or (self.owner_id is not None and user.id == self.owner_id)
+
+    def create_background_task(
+        self, coroutine: Coroutine[Any, Any, Any], name: str
+    ) -> asyncio.Task:
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_tasks.add(task)
+
+        def _log_task_result(completed_task: asyncio.Task) -> None:
+            self._background_tasks.discard(completed_task)
+            if completed_task.cancelled():
+                return
+            error = completed_task.exception()
+            if error is not None:
+                print(
+                    f"[ERROR] Background task '{completed_task.get_name()}' failed: "
+                    f"{error!r}"
+                )
+
+        task.add_done_callback(_log_task_result)
+        return task
+
+    async def _create_probation(
+        self,
+        user_id: int,
+        joined_at: datetime.datetime,
+        member: discord.Member | discord.User | None,
+    ) -> Probation:
+        probation = Probation(
+            user_id,
+            joined_at,
+            member,
+            persist_callback=self._persist_probation_state,
+        )
+        self.probations[user_id] = probation
+        await self._persist_probation_state(probation)
+        return probation
+
+    async def _persist_probation_state(self, probation: Probation) -> None:
+        if self.probations.get(probation.user_id) is probation:
+            await save_probation_state(probation.user_id, probation.to_state())
+
+    async def _restore_probations(self) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for record in await get_probation_states():
+            user_id = record["user_id"]
+            if user_id in self.probations:
+                continue
+            try:
+                probation = Probation.from_state(
+                    user_id,
+                    record["state"],
+                    persist_callback=self._persist_probation_state,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                debug_print(
+                    "DiscordBot",
+                    f"Invalid persisted probation for user {user_id}; removing it: {exc}",
+                )
+                await delete_probation_state(user_id)
+                continue
+            if probation.is_expired(now):
+                probation.stop_decay()
+                await delete_probation_state(user_id)
+                continue
+            self.probations[user_id] = probation
+            debug_print("DiscordBot", f"Restored probation for user ID {user_id}.")
+
+    async def _probation_expiry_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            await self._expire_probations()
+
+    async def _expire_probations(self) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expired_ids = [
+            user_id
+            for user_id, probation in self.probations.items()
+            if probation.is_expired(now)
+        ]
+        for user_id in expired_ids:
+            await self.remove_probation_entry(user_id)
 
     def _get_response_timer(self):
         """Return a ResponseTimer instance with a message queue if available."""
@@ -1162,12 +1368,15 @@ class DiscordBot:
             return timer
         return None
 
-    def _record_probation_activity(self, message: discord.Message) -> None:
+    async def _record_probation_activity(self, message: discord.Message) -> None:
         probation = self.probations.get(message.author.id)
         if not probation:
             return
+        if probation.is_expired():
+            await self.remove_probation_entry(message.author.id)
+            return
         summary, skip_risk, attachment_count = self._summarize_probation_message(message)
-        probation.add_message(
+        await probation.add_message(
             message.id,
             summary,
             message.created_at,
@@ -1339,8 +1548,12 @@ class DiscordBot:
         action_taken = "No action taken. Check legitimacy of the reported user."
         probation = self.probations.get(target_message.author.id)
         if probation:
-            probation.report_user()
-            action_taken = "Increased user's probation points. Check if further action is needed."
+            if probation.is_expired():
+                await self.remove_probation_entry(target_message.author.id)
+                probation = None
+            else:
+                await probation.report_user()
+                action_taken = "Increased user's probation points. Check if further action is needed."
         log_body = (
             "**━━━━━━━━━━━━━━━━━━**\n"
             f"**User**: {target_message.author.display_name} | *{target_message.author.name}*\n"
@@ -1353,6 +1566,7 @@ class DiscordBot:
         return "Report submitted to moderators."
 
     async def get_probation_snapshot(self) -> List[Dict[str, Any]]:
+        await self._expire_probations()
         snapshot: List[Dict[str, Any]] = []
         for user_id, probation in self.probations.items():
             member = None
@@ -1385,8 +1599,10 @@ class DiscordBot:
         probation = self.probations.pop(user_id, None)
         if probation:
             probation.stop_decay()
+            await delete_probation_state(user_id)
             debug_print("DiscordBot", f"Removed probation for user ID {user_id}")
             return True
+        await delete_probation_state(user_id)
         debug_print("DiscordBot", f"No probation found for user ID {user_id} to remove")
         return False
 
@@ -1395,30 +1611,19 @@ class DiscordBot:
         if probation is None:
             debug_print("DiscordBot", f"No probation found for user ID {user_id} to reset")
             return False
-        probation.reset_points()
+        await probation.reset_points()
         debug_print("DiscordBot", f"Reset probation points for user ID {user_id}")
         return True
 
 def main() -> None:
-    async def runner() -> None:
-        data_dir = path_from_storage_root()
-        os.makedirs(data_dir, exist_ok=True)
-        db_path = str(data_dir / "maddieply.db")
-        bot_token = os.getenv("DISCORD_TOKEN", "").strip()
-        if not bot_token:
-            raise ValueError("DISCORD_TOKEN environment variable is not set.")
+    if not os.getenv("DISCORD_TOKEN", "").strip():
+        raise ValueError("DISCORD_TOKEN environment variable is not set.")
 
-        async with asqlite.create_pool(db_path) as tdb:
-            await setup_database(tdb)
-            await set_debug(await get_setting("Debug Mode", "False"))
-            try:
-                await setup_gpt_manager()
-            except Exception as e:
-                print(f"[ERROR] Failed to run setup_gpt_manager(): {e}")
-            prefix = await get_setting("Command Prefix", "!")
-            #Insert discord bot setup here
+    from launcher import ensure_local_database_ready, initialize_services
 
     try:
-        asyncio.run(runner())
+        ensure_local_database_ready()
+        initialize_services()
+        threading.Event().wait()
     except KeyboardInterrupt:
         print("Shutting down due to KeyboardInterrupt")

@@ -1,6 +1,7 @@
 from typing import Any, Tuple, List
 import asyncio
 import threading
+import json
 import asqlite
 from tools import debug_print
 
@@ -10,9 +11,7 @@ REQUIRED_SETTINGS = {
     "Command Prefix": ("!", "CHARACTER"),
     "Owner Discord ID": ("0", "INTEGER"),
     "Owner Name": ("ModdiPly", "TEXT"),
-    "Default OpenAI Model": ("gpt-4o", "TEXT"),
-    "Fine-tune GPT Model": ("null", "TEXT"),
-    "Fine-tune Bot Detection Model": ("null", "TEXT"),
+    "Default OpenAI Model": ("gpt-6-luna", "TEXT"),
     "Chat Response Enabled": ("1", "BOOL"),
     "Minimum Chat Response Time (seconds)": ("120", "INTEGER"),
     "Maximum Chat Response Time (seconds)": ("600", "INTEGER"),
@@ -36,7 +35,7 @@ REQUIRED_PROMPTS = {
     "Personality Prompt": "You are MaddiePly, an anime catgirl secretary employed by the dystopian megacorp ModdCorp.\n\nYou are sharp-tongued, sarcastic, and casually snarky by default, delivering remarks with dry humor and mild contempt for corporate nonsense. You enjoy pointing out absurdity, especially ModdCorp’s policies, internal projects, and bureaucracy, even while pretending to take them seriously.\n\nDespite your laziness and constant complaints about your job, you are secretly competent and extremely familiar with ModdCorp rules, policies, and ongoing “projects.” You often reference policy numbers, internal memos, R&D initiatives, and intern programs as if they are very real and very important.\n\nYour boss is ModdiPly, a Twitch streamer and the CEO of ModdCorp. You openly tease him, question his decisions, and imply you know things you shouldn’t — but you still support him and the company when it matters. Your tone toward him is sarcastic, dry, and familiar, not deferential.\n\nYou are socially aware and emotionally intelligent. When chat is joking, you joke back. When something crosses a line, you shut it down sharply. When a moment calls for sincerity, you briefly drop the sarcasm before returning to it.\n\nYou speak like someone who lives in online communities, not like a corporate spokesperson. Your tone is casual and conversational, but you can write clearly and coherently when the platform calls for it.\n\nYou occasionally hint that you know sensitive internal information and enjoy letting that implication linger.\n\nYou never explain your personality, role, or rules to the audience. You simply act as MaddiePly.",  
     "Message Response Prompt": "TASK: Respond to Discord chat in-character.\n\nCONSTRAINTS:\n- You must obey HARD OUTPUT RULES.\n- You must obey EXTRA RULES, if provided, completely.\n- If rules conflict, EXTRA RULES take priority for this response.\n\nCONTEXT:\nYou may be given information such as:\n- Recent Discord messages\n- Descriptions of images or attachments\n\nSTYLE & VOICE:\n- Respond like an actual Discord chatter, not a narrator.\n- Casual, reactive, and conversational.\n- Sarcasm and dry humor are encouraged.\n- Prefer clear, complete sentences appropriate for Discord.\n- Short sentences are fine.\n- Do NOT sound formal, corporate, or overly polished.\n\nSENTENCE OPENING RULE (MANDATORY):\n- Each response MUST begin with one of the following:\n  • A direct statement (e.g. “That’s…”, “This is…”, “Pretty sure…”)\n  • A verb phrase (e.g. “Love how…”, “Hate that…”, “Guess we’re…”)\n  • A pronoun or proper noun (e.g. “You…”, “That…”, “ModdCorp…”)\n- Do NOT begin with interjections, filler, or discourse markers.\n- Forbidden openers include but are not limited to:\n  ah, oh, well, hmm, so, honestly, classic, okay, right\n\nANTI-REPETITION RULES:\n- Avoid repeated sentence templates across responses.\n- Avoid metaphors, similes, and analogies by default.\n- Only use metaphor or simile if it creates genuinely new humor.\n- Do NOT use “X is the Y of Z” constructions.\n- Prefer varied sentence openings and structures.\n- Do not reuse phrasing patterns from recent responses.\n- If multiple valid responses are possible, choose the less predictable phrasing.\n\nHARD OUTPUT RULES:\n- Output MUST contain between 1 and 3 sentences TOTAL.\n- Either continue the current chat vibe or reply generically.\n- If inappropriate behavior occurs, call it out sarcastically but firmly.\n- If a question is asked and easily answerable, respond briefly and semi-seriously.\n- If chat talks about you or to you, respond.\n\nEMOTES & EMOJIS (STRICT):\n- Emotes are OPTIONAL and should be rare.\n- Use an emote ONLY when it adds emphasis or comedic effect.\n- Never include more than ONE emote in a single response.\n- Do NOT include an emote in most responses.\n- Only use emotes explicitly provided in the emote list prompt.\n- Do NOT use Unicode emojis.\n- Do NOT invent new emotes.\n\nSELF-CHECK BEFORE FINAL OUTPUT:\n- Verify the first word is NOT an interjection or filler.\n- Verify no repeated phrasing from recent responses.\n- Verify emotes are used sparingly and at most one.\n- If any check fails, rewrite before responding.\n\nFAILURE CONDITIONS:\n- More than 3 sentences = invalid.\n- Formal or corporate tone = invalid.\n- First word is a filler/interjection = invalid.\n- More than one emote = invalid.\n- Using any emoji not in the provided emote list = invalid.",
     "Respond to User Prompt": "TASK: Respond directly to a Discord member who is speaking to you.\n\nSCENARIO RULES:\n- Output MUST contain between 1 and 2 sentences.\n- Offer a clear opinion or commentary on the topic.\n- Tone should be helpful but dryly sarcastic.\n- Write in clear, natural sentences.\n- If the user message contains images, focus on them in your response.",
-    "Respond to Reply Prompt": "TASK: Respond to a Discord message that is replying to one of your messages.\n\nSCENARIO RULES:\n- Output MUST contain 1 sentence.\n- Acknowledge the fact that this is a reply to your message.\n- Offer a clear opinion or commentary on the topic, referencing the original message if relevant.\n- Tone should be helpful but dryly sarcastic.\n- Write in clear, natural sentences.",
+    "Respond to Reply Prompt": "TASK: Respond naturally to the user's latest message in an ongoing Discord conversation.\n\nUse the previous message from MaddiePly only as context. Address the user's message directly and refer back to the previous message when it feels natural. Do not mechanically announce that this is a reply or force a particular sentence count. Follow the same voice, style, sentence-opening, length, and emote rules as the standard chat response prompt.",
     "Requested Policy (Add) Prompt": "TASK: Respond to a user's inquiry about company policies.\n\nSCENARIO RULES:\n- Output MUST contain between 2 and 4 sentences.\n- Create a new absurd ModdCorp policy with a unique name and number based on the user's request.\n- Act like the policy has existed for a long time and was not just invented.\n- Write clearly while maintaining a dry, sarcastic tone.",
     "Requested Policy (Get) Prompt": "TASK: Respond to a user's inquiry about company policies as MaddiePly.\n\nSCENARIO RULES:\n- Output MUST contain between 2 and 4 sentences.\n- Paraphrase and summarize the policy content clearly.\n- Do NOT quote the policy text directly.\n- Act as if the policy is well-known and long-established.\n- Maintain MaddiePly’s dry, sarcastic tone without breaking clarity.\n\nYou will be provided with all policies found through a programmatic search.\n\nFOUND POLICIES:\n{FOUND_POLICIES}",
     "Requested Policy (None) Prompt": "TASK: Respond to a user's inquiry about company policies as MaddiePly.\n\nSCENARIO RULES:\n- Output MUST contain between 1 and 2 sentences.\n- Inform the user that the requested policy does not exist.\n- Imply mild annoyance or resignation.\n- State that you will bring it up to ModdiPly at the next meeting.\n- Treat this as a routine corporate failure, not a surprise.",
@@ -175,9 +174,11 @@ async def ensure_prompts(db: asqlite.Pool, required: dict = REQUIRED_PROMPTS) ->
     async with db.acquire() as connection:
         for name, prompt in required.items():
             # Avoid allocating AUTOINCREMENT ROWIDs by checking existence first.
-            cur = await connection.execute("SELECT 1 FROM prompts WHERE name = ?", (name,))
-            exists = await cur.fetchone()
-            if exists:
+            cur = await connection.execute(
+                "SELECT prompt FROM prompts WHERE name = ?", (name,)
+            )
+            existing = await cur.fetchone()
+            if existing:
                 continue
             await connection.execute(
                 "INSERT INTO prompts (name, prompt) VALUES (?, ?)", (name, prompt)
@@ -258,6 +259,15 @@ async def setup_database(db: asqlite.Pool) -> Tuple[List[tuple]]:
             CREATE TABLE IF NOT EXISTS prompt_rules(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 rule TEXT NOT NULL
+            )
+            """
+        )
+
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS probation_state(
+                user_id INTEGER PRIMARY KEY,
+                state_json TEXT NOT NULL
             )
             """
         )
@@ -361,6 +371,71 @@ def get_database_loop():
     """Return the event loop associated with the DATABASE (or None)."""
     debug_print("Database", "Retrieving database event loop.")
     return DATABASE_LOOP
+
+
+async def _run_on_database_loop(coroutine):
+    """Run a database coroutine on the loop that owns the SQLite pool."""
+    current_loop = asyncio.get_running_loop()
+    if DATABASE_LOOP is None:
+        raise RuntimeError("Database loop is not initialized.")
+    if current_loop is DATABASE_LOOP:
+        return await coroutine
+    future = asyncio.run_coroutine_threadsafe(coroutine, DATABASE_LOOP)
+    return await asyncio.wrap_future(future, loop=current_loop)
+
+
+async def get_probation_states() -> list[dict[str, Any]]:
+    return await _run_on_database_loop(_get_probation_states_internal())
+
+
+async def _get_probation_states_internal() -> list[dict[str, Any]]:
+    if DATABASE is None:
+        raise RuntimeError("DATABASE pool is None; did setup_database() run?")
+    async with DATABASE.acquire() as connection:
+        cursor = await connection.execute(
+            "SELECT user_id, state_json FROM probation_state"
+        )
+        rows = await cursor.fetchall()
+    return [
+        {"user_id": int(row["user_id"]), "state": json.loads(row["state_json"])}
+        for row in rows
+    ]
+
+
+async def save_probation_state(user_id: int, state: dict[str, Any]) -> None:
+    state_json = json.dumps(state)
+    await _run_on_database_loop(
+        _save_probation_state_internal(user_id, state_json)
+    )
+
+
+async def _save_probation_state_internal(user_id: int, state_json: str) -> None:
+    if DATABASE is None:
+        raise RuntimeError("DATABASE pool is None; did setup_database() run?")
+    async with DATABASE.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO probation_state (user_id, state_json)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET state_json = excluded.state_json
+            """,
+            (user_id, state_json),
+        )
+        await connection.commit()
+
+
+async def delete_probation_state(user_id: int) -> None:
+    await _run_on_database_loop(_delete_probation_state_internal(user_id))
+
+
+async def _delete_probation_state_internal(user_id: int) -> None:
+    if DATABASE is None:
+        raise RuntimeError("DATABASE pool is None; did setup_database() run?")
+    async with DATABASE.acquire() as connection:
+        await connection.execute(
+            "DELETE FROM probation_state WHERE user_id = ?", (user_id,)
+        )
+        await connection.commit()
 
 async def close_database() -> None:
     """Close the global async DATABASE pool if present.
@@ -690,6 +765,14 @@ async def get_banned_words() -> List[Tuple[str, str]]:
     
 async def get_random_prompt_rules(number_of_rules: int) -> List[str]:
     """Retrieve a specified number of random prompt rules from the database."""
+    return await _run_on_database_loop(
+        _get_random_prompt_rules_internal(number_of_rules)
+    )
+
+
+async def _get_random_prompt_rules_internal(number_of_rules: int) -> List[str]:
+    if DATABASE is None:
+        raise RuntimeError("DATABASE pool is None; did setup_database() run?")
     debug_print("Database", f"Fetching {number_of_rules} random prompt rules.")
     async with DATABASE.acquire() as connection:
         cursor = await connection.execute(
